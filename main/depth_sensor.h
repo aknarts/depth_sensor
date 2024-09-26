@@ -22,7 +22,7 @@
  * The string should be started with the length of its own.
  */
 #define MANUFACTURER_NAME               "\x09""Acheta"
-#define MODEL_IDENTIFIER                "\x07""Depth Sensor"
+#define MODEL_IDENTIFIER                "\x07""DepthSensor"
 
 #define ESP_ZB_ZED_CONFIG()                                         \
     {                                                               \

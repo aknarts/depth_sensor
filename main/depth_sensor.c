@@ -18,6 +18,8 @@ static ultrasonic_sensor_t sensor = {
 		.echo_pin = ECHO_GPIO
 };
 
+static const char *TAG = "ESP_ZB_DIST_SENSOR";
+
 void ultrasonic_task(void *pvParameters)
 {
 	while (true)
@@ -30,24 +32,25 @@ void ultrasonic_task(void *pvParameters)
 			switch (res)
 			{
 				case ESP_ERR_ULTRASONIC_PING:
-					printf("Cannot ping (device is in invalid state)\n");
+					ESP_LOGW(TAG, "Cannot ping (device is in invalid state)\n");
 					break;
 				case ESP_ERR_ULTRASONIC_PING_TIMEOUT:
-					printf("Ping timeout (echo timeout)\n");
+					ESP_LOGW(TAG, "Ping timeout (echo timeout)\n");
 					break;
 				case ESP_ERR_ULTRASONIC_ECHO_TIMEOUT:
-					printf("Echo timeout (i.e. distance too big)\n");
+					ESP_LOGW(TAG, "Echo timeout (i.e. distance too big)\n");
 					break;
 				default:
-					printf("%s\n", esp_err_to_name(res));
+					ESP_LOGE(TAG, "%s\n", esp_err_to_name(res));
 			}
 		} else
 		{
-			printf("Distance: %ld cm\n", distance);
+			ESP_LOGI(TAG, "Distance: %ld cm", distance);
+			float fdistance = (float) distance;
 			esp_zb_lock_acquire(portMAX_DELAY);
 			esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
-										 ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-										 ESP_ZB_ZCL_ATTR_ILLUMINANCE_MEASUREMENT_MEASURED_VALUE_ID, &distance, false);
+										 ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+										 ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &fdistance, false);
 			esp_zb_lock_release();
 		}
 
@@ -56,7 +59,7 @@ void ultrasonic_task(void *pvParameters)
 	}
 }
 
-static const char *TAG = "ESP_ZB_DIST_SENSOR";
+
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
@@ -132,7 +135,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 	}
 }
 
-static esp_zb_cluster_list_t *custom_distance_sensor_clusters_create(esp_zb_light_sensor_cfg_t *distance_sensor)
+static esp_zb_cluster_list_t *custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor)
 {
 	esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
 
@@ -156,15 +159,15 @@ static esp_zb_cluster_list_t *custom_distance_sensor_clusters_create(esp_zb_ligh
 	ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(cluster_list, esp_zb_zcl_attr_list_create(
 			ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
 
-	ESP_ERROR_CHECK(esp_zb_cluster_list_add_illuminance_meas_cluster(cluster_list,
-																 esp_zb_illuminance_meas_cluster_create(
-																		&(distance_sensor->illuminance_cfg)),
-																ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+	ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_output_cluster(cluster_list,
+																  esp_zb_analog_output_cluster_create(
+																		  distance_sensor),
+																  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 	return cluster_list;
 }
 
 static esp_zb_ep_list_t *
-custom_distance_sensor_ep_create(uint8_t endpoint_id, esp_zb_light_sensor_cfg_t *distance_sensor)
+custom_distance_sensor_ep_create(uint8_t endpoint_id, esp_zb_analog_output_cluster_cfg_t *distance_sensor)
 {
 	esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
 	esp_zb_endpoint_config_t endpoint_config = {
@@ -185,24 +188,8 @@ static void esp_zb_task(void *pvParameters)
 	esp_zb_init(&zb_nwk_cfg);
 	printf("Zigbee stack initialized\n");
 
-	esp_zb_light_sensor_cfg_t sensor_cfg = {
-			.basic_cfg =
-					{
-							.zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
-							.power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
-					},
-			.identify_cfg =
-					{
-							.identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE,
-					},
-			.illuminance_cfg =
-					{
-							.measured_value = ESP_ZB_ZCL_TEMP_MEASUREMENT_MEASURED_VALUE_DEFAULT,
-							.min_value = ESP_DIST_SENSOR_MIN_VALUE,
-							.max_value = ESP_DIST_SENSOR_MAX_VALUE,
-					},
-	};
-	esp_zb_ep_list_t *esp_zb_sensor_ep = custom_distance_sensor_ep_create(HA_ESP_SENSOR_ENDPOINT, &sensor_cfg);
+	esp_zb_analog_output_cluster_cfg_t analog_cfg = {.out_of_service = false, .present_value = 0, .status_flags = 0};
+	esp_zb_ep_list_t *esp_zb_sensor_ep = custom_distance_sensor_ep_create(HA_ESP_SENSOR_ENDPOINT, &analog_cfg);
 
 	/* Register the device */
 	esp_zb_device_register(esp_zb_sensor_ep);
@@ -211,7 +198,7 @@ static void esp_zb_task(void *pvParameters)
 	esp_zb_zcl_reporting_info_t reporting_info = {
 			.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
 			.ep = HA_ESP_SENSOR_ENDPOINT,
-			.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT,
+			.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT,
 			.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
 			.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
 			.u.send_info.min_interval = 1,
@@ -219,7 +206,7 @@ static void esp_zb_task(void *pvParameters)
 			.u.send_info.def_min_interval = 1,
 			.u.send_info.def_max_interval = 0,
 			.u.send_info.delta.u16 = 100,
-			.attr_id = ESP_ZB_ZCL_ATTR_ILLUMINANCE_MEASUREMENT_MEASURED_VALUE_ID,
+			.attr_id = ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID,
 			.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
 	};
 

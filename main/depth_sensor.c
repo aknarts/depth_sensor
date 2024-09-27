@@ -293,7 +293,7 @@ static void esp_zb_task(void *pvParameters)
 	};
 
 	esp_zb_zcl_update_reporting_info(&reporting_info);
-	esp_zb_core_action_handler_register(zb_action_handler);
+//	esp_zb_core_action_handler_register(zb_action_handler);
 	esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
 	ESP_ERROR_CHECK(esp_zb_start(false));
 

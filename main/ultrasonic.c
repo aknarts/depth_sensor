@@ -33,8 +33,8 @@ static inline uint32_t get_time_us()
 
 void ultrasonic_init(const ultrasonic_sensor_t *dev)
 {
-	gpio_reset_pin( dev->trigger_pin );
-	gpio_reset_pin( dev->echo_pin );
+	gpio_reset_pin(dev->trigger_pin);
+	gpio_reset_pin(dev->echo_pin);
 	gpio_set_direction(dev->trigger_pin, GPIO_MODE_OUTPUT);
 	gpio_set_direction(dev->echo_pin, GPIO_MODE_INPUT);
 
@@ -64,7 +64,10 @@ esp_err_t ultrasonic_measure_cm(const ultrasonic_sensor_t *dev, uint32_t max_dis
 	while (!gpio_get_level(dev->echo_pin))
 	{
 		if (timeout_expired(start, PING_TIMEOUT))
-			RETURN_CRTCAL(mux, ESP_ERR_ULTRASONIC_PING_TIMEOUT);
+		{
+			portEXIT_CRITICAL(&mux);
+			return ESP_ERR_ULTRASONIC_PING_TIMEOUT;
+		}
 	}
 
 	// got echo, measuring
@@ -80,10 +83,11 @@ esp_err_t ultrasonic_measure_cm(const ultrasonic_sensor_t *dev, uint32_t max_dis
 
 	if (temp > max_distance)
 	{
-		RETURN_CRTCAL(mux, ESP_ERR_ULTRASONIC_ECHO_TIMEOUT);
+		portEXIT_CRITICAL(&mux);
+		return ESP_ERR_ULTRASONIC_ECHO_TIMEOUT;
 	}
 
-	*distance = (int32_t)temp;
+	*distance = (int32_t) temp;
 
 	return ESP_OK;
 }

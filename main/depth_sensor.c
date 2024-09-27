@@ -10,6 +10,8 @@
 #include "nvs_flash.h"
 #include "ha/esp_zigbee_ha_standard.h"
 
+//TODO: https://github.com/Koenkk/zigbee2mqtt/issues/18321
+
 #define TRIGGER_GPIO 7
 #define ECHO_GPIO 14
 
@@ -60,7 +62,6 @@ void ultrasonic_task(void *pvParameters)
 }
 
 
-
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
 	ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, ,
@@ -70,6 +71,7 @@ static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 static esp_err_t deferred_driver_init(void)
 {
 	ultrasonic_init(&sensor);
+	light_driver_init(LIGHT_DEFAULT_OFF);
 	xTaskCreate(ultrasonic_task, "ultrasonic_task", configMINIMAL_STACK_SIZE * 3, NULL, 5, NULL);
 	return ESP_OK;
 }
@@ -135,7 +137,74 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 	}
 }
 
-static esp_zb_cluster_list_t *custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor)
+static void esp_zb_identify(void *pvParameters)
+{
+	bool light_state = false;
+	for (int i = 0; i < 50; ++i)
+	{
+		light_state = !light_state;
+		light_driver_set_power(light_state);
+
+		vTaskDelay(pdMS_TO_TICKS(1000));
+	};
+	light_driver_set_power(false);
+}
+
+static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
+{
+	esp_err_t ret = ESP_OK;
+
+	ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message");
+	ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG,
+						"Received message: error status(%d)",
+						message->info.status);
+	ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)",
+			 message->info.dst_endpoint, message->info.cluster,
+			 message->attribute.id, message->attribute.data.size);
+	if (message->info.dst_endpoint == HA_ESP_SENSOR_ENDPOINT)
+	{
+		if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY)
+		{
+			xTaskCreate(esp_zb_identify, "Identify", 4096, NULL, 5, NULL);
+		}
+	}
+	return ret;
+}
+
+
+static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
+{
+	esp_err_t ret = ESP_OK;
+	switch (callback_id)
+	{
+		case ESP_ZB_CORE_REPORT_ATTR_CB_ID:
+//			ret = zb_attribute_reporting_handler((esp_zb_zcl_report_attr_message_t *)message);
+			ESP_LOGI(TAG, "Report attribute callback");
+			break;
+		case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID:
+//			ret = zb_read_attr_resp_handler((esp_zb_zcl_cmd_read_attr_resp_message_t *)message);
+			ESP_LOGI(TAG, "Read attribute response callback");
+			break;
+		case ESP_ZB_CORE_CMD_REPORT_CONFIG_RESP_CB_ID:
+			ESP_LOGI(TAG, "Configure report response callback");
+//			ret = zb_configure_report_resp_handler((esp_zb_zcl_cmd_config_report_resp_message_t *)message);
+			break;
+		case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
+			ESP_LOGI(TAG, "Set attribute value callback");
+			ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *) message);
+			break;
+		case ESP_ZB_CORE_IDENTIFY_EFFECT_CB_ID:
+			ESP_LOGI(TAG, "Identify effect callback");
+			break;
+		default:
+			ESP_LOGW(TAG, "Receive Zigbee action(0x%x) callback", callback_id);
+			break;
+	}
+	return ret;
+}
+
+static esp_zb_cluster_list_t *
+custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor)
 {
 	esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
 
@@ -149,7 +218,20 @@ static esp_zb_cluster_list_t *custom_distance_sensor_clusters_create(esp_zb_anal
 												  MANUFACTURER_NAME));
 	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,
 												  MODEL_IDENTIFIER));
-	ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+	uint32_t SWBuildID = 0x01;
+	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID,
+												  &SWBuildID));
+	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_DATE_CODE_ID,
+												  &SWBuildID));
+	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_HW_VERSION_ID,
+												  &SWBuildID));
+	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_STACK_VERSION_ID,
+												  &SWBuildID));
+	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_APPLICATION_VERSION_ID,
+												  &SWBuildID));
+
+	ESP_ERROR_CHECK(
+			esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
 	esp_zb_identify_cluster_cfg_t identify_cfg = {
 			.identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE,
@@ -173,7 +255,7 @@ custom_distance_sensor_ep_create(uint8_t endpoint_id, esp_zb_analog_output_clust
 	esp_zb_endpoint_config_t endpoint_config = {
 			.endpoint = endpoint_id,
 			.app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-			.app_device_id = ESP_ZB_HA_LIGHT_SENSOR_DEVICE_ID,
+			.app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
 			.app_device_version = 0
 	};
 	esp_zb_ep_list_add_ep(ep_list, custom_distance_sensor_clusters_create(distance_sensor), endpoint_config);
@@ -211,7 +293,7 @@ static void esp_zb_task(void *pvParameters)
 	};
 
 	esp_zb_zcl_update_reporting_info(&reporting_info);
-
+	esp_zb_core_action_handler_register(zb_action_handler);
 	esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
 	ESP_ERROR_CHECK(esp_zb_start(false));
 

@@ -14,8 +14,15 @@
 #define HA_ESP_SENSOR_ENDPOINT          1
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK    /* Zigbee primary channel mask use in the example */
 
+/* Distance sendor configuration */
 #define ESP_DIST_SENSOR_UPDATE_INTERVAL (1)     /* Local sensor update interval (second) */
 #define ESP_DIST_SENSOR_MAX_VALUE       (600)    /* Local sensor max measured value (cm) */
+
+
+/* Temperature sensor configuration */
+#define ESP_TEMP_SENSOR_UPDATE_INTERVAL (1)     /* Local sensor update interval (second) */
+#define ESP_TEMP_SENSOR_MIN_VALUE       (-10)   /* Local sensor min measured value (degree Celsius) */
+#define ESP_TEMP_SENSOR_MAX_VALUE       (80)    /* Local sensor max measured value (degree Celsius) */
 
 /* Attribute values in ZCL string format
  * The string should be started with the length of its own.

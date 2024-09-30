@@ -1,11 +1,11 @@
-const {identify, numeric} = require('zigbee-herdsman-converters/lib/modernExtend');
+const {identify, numeric, temperature, light} = require('zigbee-herdsman-converters/lib/modernExtend');
 
 const definition = {
     zigbeeModel: ['Depth.Sensor'],
     model: 'Depth.Sensor',
     vendor: 'Acheta',
     description: 'Automatically generated definition',
-    extend: [identify(), numeric({
+    extend: [identify(), light({"color": true, "effect": false, "powerOnBehavior": false}), temperature(), numeric({
         name: 'depth',
         cluster: 'genAnalogOutput',
         attribute: 'presentValue',

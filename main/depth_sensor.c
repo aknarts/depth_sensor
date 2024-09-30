@@ -9,6 +9,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "temp_sensor_driver.h"
 #include "ha/esp_zigbee_ha_standard.h"
 
 //TODO: https://github.com/Koenkk/zigbee2mqtt/issues/18321
@@ -24,6 +25,11 @@ static ultrasonic_sensor_t sensor = {
 };
 
 static const char *TAG = "ESP_ZB_DIST_SENSOR";
+
+static int16_t zb_temperature_to_s16(float temp)
+{
+	return (int16_t) (temp * 100);
+}
 
 float calculate_average(float values[], int count)
 {
@@ -92,11 +98,28 @@ static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 						TAG, "Failed to start Zigbee bdb commissioning");
 }
 
+static void esp_app_temp_sensor_handler(float temperature)
+{
+	int16_t measured_value = zb_temperature_to_s16(temperature);
+	/* Update temperature sensor measured value */
+	esp_zb_lock_acquire(portMAX_DELAY);
+	esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
+								 ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+								 ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, &measured_value, false);
+	esp_zb_lock_release();
+}
+
 static esp_err_t deferred_driver_init(void)
 {
 	ultrasonic_init(&sensor);
 	light_driver_init(LIGHT_DEFAULT_OFF);
 	xTaskCreate(ultrasonic_task, "ultrasonic_task", configMINIMAL_STACK_SIZE * 3, NULL, 5, NULL);
+	temperature_sensor_config_t temp_sensor_config =
+			TEMPERATURE_SENSOR_CONFIG_DEFAULT(ESP_TEMP_SENSOR_MIN_VALUE, ESP_TEMP_SENSOR_MAX_VALUE);
+	ESP_RETURN_ON_ERROR(
+			temp_sensor_driver_init(&temp_sensor_config, ESP_TEMP_SENSOR_UPDATE_INTERVAL, esp_app_temp_sensor_handler),
+			TAG,
+			"Failed to initialize temperature sensor");
 	return ESP_OK;
 }
 
@@ -179,7 +202,10 @@ static void esp_zb_identify(void *pvParameters)
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
 {
 	esp_err_t ret = ESP_OK;
-
+	bool light_state = 0;
+	uint8_t light_level = 0;
+	uint16_t light_color_x = 0;
+	uint16_t light_color_y = 0;
 	ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message");
 	ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG,
 						"Received message: error status(%d)",
@@ -189,9 +215,70 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 			 message->attribute.id, message->attribute.data.size);
 	if (message->info.dst_endpoint == HA_ESP_SENSOR_ENDPOINT)
 	{
-		if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY)
+		switch (message->info.cluster)
 		{
-			xTaskCreate(esp_zb_identify, "Identify", 4096, NULL, 5, NULL);
+			case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF:
+				if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID &&
+					message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL)
+				{
+					light_state = message->attribute.data.value ? *(bool *) message->attribute.data.value : light_state;
+					ESP_LOGI(TAG, "Light sets to %s", light_state ? "On" : "Off");
+					light_driver_set_power(light_state);
+				} else
+				{
+					ESP_LOGW(TAG, "On/Off cluster data: attribute(0x%x), type(0x%x)", message->attribute.id,
+							 message->attribute.data.type);
+				}
+				break;
+			case ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL:
+				if (message->attribute.id == ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_X_ID &&
+					message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16)
+				{
+					light_color_x = message->attribute.data.value ? *(uint16_t *) message->attribute.data.value
+																  : light_color_x;
+					light_color_y = *(uint16_t *) esp_zb_zcl_get_attribute(message->info.dst_endpoint,
+																		   message->info.cluster,
+																		   ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+																		   ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_Y_ID)
+							->data_p;
+					ESP_LOGI(TAG, "Light color x changes to 0x%x", light_color_x);
+				} else if (message->attribute.id == ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_Y_ID &&
+						   message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16)
+				{
+					light_color_y = message->attribute.data.value ? *(uint16_t *) message->attribute.data.value
+																  : light_color_y;
+					light_color_x = *(uint16_t *) esp_zb_zcl_get_attribute(message->info.dst_endpoint,
+																		   message->info.cluster,
+																		   ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+																		   ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_X_ID)
+							->data_p;
+					ESP_LOGI(TAG, "Light color y changes to 0x%x", light_color_y);
+				} else
+				{
+					ESP_LOGW(TAG, "Color control cluster data: attribute(0x%x), type(0x%x)", message->attribute.id,
+							 message->attribute.data.type);
+				}
+				light_driver_set_color_xy(light_color_x, light_color_y);
+				break;
+			case ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL:
+				if (message->attribute.id == ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID &&
+					message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U8)
+				{
+					light_level = message->attribute.data.value ? *(uint8_t *) message->attribute.data.value
+																: light_level;
+					light_driver_set_level((uint8_t) light_level);
+					ESP_LOGI(TAG, "Light level changes to %d", light_level);
+				} else
+				{
+					ESP_LOGW(TAG, "Level Control cluster data: attribute(0x%x), type(0x%x)", message->attribute.id,
+							 message->attribute.data.type);
+				}
+				break;
+			case ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY:
+				xTaskCreate(esp_zb_identify, "Identify", 4096, NULL, 5, NULL);
+			default:
+				ESP_LOGI(TAG, "Message data: cluster(0x%x), attribute(0x%x)  ", message->info.cluster,
+						 message->attribute.id);
 		}
 	}
 	return ret;
@@ -233,30 +320,22 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 }
 
 static esp_zb_cluster_list_t *
-custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor)
+custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor,
+									   esp_zb_temperature_meas_cluster_cfg_t *temperature_sensor,
+									   esp_zb_color_dimmable_light_cfg_t *light)
 {
 	esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
 
-	esp_zb_basic_cluster_cfg_t basic_cfg =
-			{
-					.zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
-					.power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
-			};
-	esp_zb_attribute_list_t *basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
+	esp_zb_attribute_list_t *basic_cluster = esp_zb_basic_cluster_create(&light->basic_cfg);
 	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID,
 												  MANUFACTURER_NAME));
 	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,
 												  MODEL_IDENTIFIER));
-
-
 	ESP_ERROR_CHECK(
 			esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
-	esp_zb_identify_cluster_cfg_t identify_cfg = {
-			.identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE,
-	};
 	ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(cluster_list, esp_zb_identify_cluster_create(
-			&identify_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+			&light->identify_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 	ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(cluster_list, esp_zb_zcl_attr_list_create(
 			ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY), ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
 
@@ -264,11 +343,37 @@ custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *dista
 																  esp_zb_analog_output_cluster_create(
 																		  distance_sensor),
 																  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+	ESP_ERROR_CHECK(esp_zb_cluster_list_add_temperature_meas_cluster(cluster_list,
+																	 esp_zb_temperature_meas_cluster_create(
+																			 temperature_sensor),
+																	 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+	ESP_ERROR_CHECK(esp_zb_cluster_list_add_on_off_cluster(cluster_list,
+														   esp_zb_on_off_cluster_create(
+																   &light->on_off_cfg),
+														   ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+	ESP_ERROR_CHECK(esp_zb_cluster_list_add_color_control_cluster(cluster_list,
+																  esp_zb_color_control_cluster_create(
+																		  &light->color_cfg),
+																  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+	ESP_ERROR_CHECK(esp_zb_cluster_list_add_scenes_cluster(cluster_list,
+														   esp_zb_scenes_cluster_create(
+																   &light->scenes_cfg),
+														   ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+	ESP_ERROR_CHECK(esp_zb_cluster_list_add_level_cluster(cluster_list,
+														  esp_zb_level_cluster_create(
+																  &light->level_cfg),
+														  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+	ESP_ERROR_CHECK(esp_zb_cluster_list_add_groups_cluster(cluster_list,
+														  esp_zb_groups_cluster_create(
+																  &light->groups_cfg),
+														  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 	return cluster_list;
 }
 
 static esp_zb_ep_list_t *
-custom_distance_sensor_ep_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor)
+custom_distance_sensor_ep_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor,
+								 esp_zb_temperature_meas_cluster_cfg_t *temperature_sensor,
+								 esp_zb_color_dimmable_light_cfg_t *light)
 {
 	esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
 	esp_zb_endpoint_config_t endpoint_config = {
@@ -277,7 +382,8 @@ custom_distance_sensor_ep_create(esp_zb_analog_output_cluster_cfg_t *distance_se
 			.app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
 			.app_device_version = 0
 	};
-	esp_zb_ep_list_add_ep(ep_list, custom_distance_sensor_clusters_create(distance_sensor), endpoint_config);
+	esp_zb_ep_list_add_ep(ep_list, custom_distance_sensor_clusters_create(distance_sensor, temperature_sensor, light),
+						  endpoint_config);
 	return ep_list;
 }
 
@@ -289,7 +395,47 @@ static void esp_zb_task(void *pvParameters)
 	esp_zb_init(&zb_nwk_cfg);
 
 	esp_zb_analog_output_cluster_cfg_t analog_cfg = {.out_of_service = false, .present_value = 0, .status_flags = 0};
-	esp_zb_ep_list_t *esp_zb_sensor_ep = custom_distance_sensor_ep_create(&analog_cfg);
+	esp_zb_temperature_meas_cluster_cfg_t temp_cfg = {.measured_value = ESP_ZB_ZCL_TEMP_MEASUREMENT_MEASURED_VALUE_DEFAULT, .min_value = zb_temperature_to_s16(
+			ESP_TEMP_SENSOR_MIN_VALUE), .max_value = zb_temperature_to_s16(ESP_TEMP_SENSOR_MAX_VALUE)};
+	esp_zb_color_dimmable_light_cfg_t light_cfg = {
+			.basic_cfg = {
+					.zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+					.power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+			},
+			.on_off_cfg = {
+					.on_off = false,
+			},
+			.color_cfg = {
+					.current_x = ESP_ZB_ZCL_COLOR_CONTROL_CURRENT_X_DEF_VALUE,
+					.current_y = ESP_ZB_ZCL_COLOR_CONTROL_CURRENT_Y_DEF_VALUE,
+					.color_mode = ESP_ZB_ZCL_COLOR_CONTROL_COLOR_MODE_DEFAULT_VALUE,
+					.options = ESP_ZB_ZCL_COLOR_CONTROL_OPTIONS_DEFAULT_VALUE,
+					.enhanced_color_mode = ESP_ZB_ZCL_COLOR_CONTROL_ENHANCED_COLOR_MODE_DEFAULT_VALUE,
+					.color_capabilities = 0x0008,
+			},
+			.level_cfg =
+					{
+							.current_level = ESP_ZB_ZCL_LEVEL_CONTROL_CURRENT_LEVEL_DEFAULT_VALUE,
+					},
+			.scenes_cfg =
+					{
+							.scenes_count = ESP_ZB_ZCL_SCENES_SCENE_COUNT_DEFAULT_VALUE,
+							.current_scene = ESP_ZB_ZCL_SCENES_CURRENT_SCENE_DEFAULT_VALUE,
+							.current_group = ESP_ZB_ZCL_SCENES_CURRENT_GROUP_DEFAULT_VALUE,
+							.scene_valid = ESP_ZB_ZCL_SCENES_SCENE_VALID_DEFAULT_VALUE,
+							.name_support = ESP_ZB_ZCL_SCENES_NAME_SUPPORT_DEFAULT_VALUE,
+					},
+			.groups_cfg =
+					{
+							.groups_name_support_id = ESP_ZB_ZCL_GROUPS_NAME_SUPPORT_DEFAULT_VALUE,
+					},
+			.identify_cfg =
+					{
+							.identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE,
+					},
+
+	};
+	esp_zb_ep_list_t *esp_zb_sensor_ep = custom_distance_sensor_ep_create(&analog_cfg, &temp_cfg, &light_cfg);
 
 	/* Register the device */
 	esp_zb_device_register(esp_zb_sensor_ep);

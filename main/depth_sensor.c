@@ -68,6 +68,11 @@ static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 						TAG, "Failed to start Zigbee bdb commissioning");
 }
 
+static int16_t zb_temperature_to_s16(float temp)
+{
+	return (int16_t)(temp * 100);
+}
+
 static esp_err_t deferred_driver_init(void)
 {
 	ultrasonic_init(&sensor);
@@ -218,17 +223,7 @@ custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *dista
 												  MANUFACTURER_NAME));
 	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,
 												  MODEL_IDENTIFIER));
-	uint32_t SWBuildID = 0x01;
-	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID,
-												  &SWBuildID));
-	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_DATE_CODE_ID,
-												  &SWBuildID));
-	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_HW_VERSION_ID,
-												  &SWBuildID));
-	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_STACK_VERSION_ID,
-												  &SWBuildID));
-	ESP_ERROR_CHECK(esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_APPLICATION_VERSION_ID,
-												  &SWBuildID));
+
 
 	ESP_ERROR_CHECK(
 			esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
@@ -270,6 +265,11 @@ static void esp_zb_task(void *pvParameters)
 	esp_zb_init(&zb_nwk_cfg);
 	printf("Zigbee stack initialized\n");
 
+	/* Create customized temperature sensor endpoint */
+	esp_zb_temperature_sensor_cfg_t sensor_cfg = ESP_ZB_DEFAULT_TEMPERATURE_SENSOR_CONFIG();
+	/* Set (Min|Max)MeasuredValure */
+	sensor_cfg.temp_meas_cfg.min_value = zb_temperature_to_s16(ESP_TEMP_SENSOR_MIN_VALUE);
+	sensor_cfg.temp_meas_cfg.max_value = zb_temperature_to_s16(ESP_TEMP_SENSOR_MAX_VALUE);
 	esp_zb_analog_output_cluster_cfg_t analog_cfg = {.out_of_service = false, .present_value = 0, .status_flags = 0};
 	esp_zb_ep_list_t *esp_zb_sensor_ep = custom_distance_sensor_ep_create(HA_ESP_SENSOR_ENDPOINT, &analog_cfg);
 

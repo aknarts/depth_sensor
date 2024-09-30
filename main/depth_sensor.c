@@ -25,9 +25,11 @@ static ultrasonic_sensor_t sensor = {
 
 static const char *TAG = "ESP_ZB_DIST_SENSOR";
 
-float calculate_average(float values[], int count) {
+float calculate_average(float values[], int count)
+{
 	float sum = 0.0;
-	for (int i = 0; i < count; i++) {
+	for (int i = 0; i < count; i++)
+	{
 		sum += values[i];
 	}
 	return sum / count;
@@ -65,10 +67,11 @@ _Noreturn void ultrasonic_task(void *pvParameters)
 			ESP_LOGI(TAG, "Distance: %ld cm", distance);
 			values[currentIndex] = (float) distance;
 			currentIndex = (currentIndex + 1) % MAX_VALUES;
-			if (count < MAX_VALUES) {
+			if (count < MAX_VALUES)
+			{
 				count++;
 			}
-			float fdistance = calculate_average(values, count);
+			float fdistance = roundf(calculate_average(values, count));
 			ESP_LOGI(TAG, "Distance Average: %f cm", fdistance);
 			esp_zb_lock_acquire(portMAX_DELAY);
 			esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
@@ -281,7 +284,7 @@ custom_distance_sensor_ep_create(esp_zb_analog_output_cluster_cfg_t *distance_se
 static void esp_zb_task(void *pvParameters)
 {
 	/* Initialize Zigbee stack */
-	esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
+	esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZR_CONFIG();
 
 	esp_zb_init(&zb_nwk_cfg);
 
@@ -324,6 +327,5 @@ void app_main(void)
 	};
 	ESP_ERROR_CHECK(nvs_flash_init());
 	ESP_ERROR_CHECK(esp_zb_platform_config(&config));
-	printf("Starting Zigbee task\n");
 	xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
 }

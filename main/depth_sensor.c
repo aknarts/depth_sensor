@@ -1,3 +1,4 @@
+#include <sys/cdefs.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <freertos/FreeRTOS.h>
@@ -15,6 +16,8 @@
 #define TRIGGER_GPIO 7
 #define ECHO_GPIO 14
 
+#define MAX_VALUES 10
+
 static ultrasonic_sensor_t sensor = {
 		.trigger_pin = TRIGGER_GPIO,
 		.echo_pin = ECHO_GPIO
@@ -22,8 +25,20 @@ static ultrasonic_sensor_t sensor = {
 
 static const char *TAG = "ESP_ZB_DIST_SENSOR";
 
-void ultrasonic_task(void *pvParameters)
+float calculate_average(float values[], int count) {
+	float sum = 0.0;
+	for (int i = 0; i < count; i++) {
+		sum += values[i];
+	}
+	return sum / count;
+}
+
+_Noreturn void ultrasonic_task(void *pvParameters)
 {
+	float values[MAX_VALUES] = {0.0};
+	int currentIndex = 0;
+	int count = 0;
+
 	while (true)
 	{
 		int32_t distance;
@@ -48,7 +63,13 @@ void ultrasonic_task(void *pvParameters)
 		} else
 		{
 			ESP_LOGI(TAG, "Distance: %ld cm", distance);
-			float fdistance = (float) distance;
+			values[currentIndex] = (float) distance;
+			currentIndex = (currentIndex + 1) % MAX_VALUES;
+			if (count < MAX_VALUES) {
+				count++;
+			}
+			float fdistance = calculate_average(values, count);
+			ESP_LOGI(TAG, "Distance Average: %f cm", fdistance);
 			esp_zb_lock_acquire(portMAX_DELAY);
 			esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
 										 ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
@@ -66,11 +87,6 @@ static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
 	ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, ,
 						TAG, "Failed to start Zigbee bdb commissioning");
-}
-
-static int16_t zb_temperature_to_s16(float temp)
-{
-	return (int16_t)(temp * 100);
 }
 
 static esp_err_t deferred_driver_init(void)
@@ -153,6 +169,8 @@ static void esp_zb_identify(void *pvParameters)
 		vTaskDelay(pdMS_TO_TICKS(1000));
 	};
 	light_driver_set_power(false);
+	vTaskDelay(pdMS_TO_TICKS(1000));
+	vTaskDelete(NULL);
 }
 
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
@@ -201,6 +219,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 		case ESP_ZB_CORE_IDENTIFY_EFFECT_CB_ID:
 			ESP_LOGI(TAG, "Identify effect callback");
 			break;
+		case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
+			ESP_LOGI(TAG, "Default response callback");
+			break;
 		default:
 			ESP_LOGW(TAG, "Receive Zigbee action(0x%x) callback", callback_id);
 			break;
@@ -244,11 +265,11 @@ custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *dista
 }
 
 static esp_zb_ep_list_t *
-custom_distance_sensor_ep_create(uint8_t endpoint_id, esp_zb_analog_output_cluster_cfg_t *distance_sensor)
+custom_distance_sensor_ep_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor)
 {
 	esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
 	esp_zb_endpoint_config_t endpoint_config = {
-			.endpoint = endpoint_id,
+			.endpoint = HA_ESP_SENSOR_ENDPOINT,
 			.app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
 			.app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
 			.app_device_version = 0
@@ -261,17 +282,11 @@ static void esp_zb_task(void *pvParameters)
 {
 	/* Initialize Zigbee stack */
 	esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
-	printf("Initializing Zigbee stack\n");
-	esp_zb_init(&zb_nwk_cfg);
-	printf("Zigbee stack initialized\n");
 
-	/* Create customized temperature sensor endpoint */
-	esp_zb_temperature_sensor_cfg_t sensor_cfg = ESP_ZB_DEFAULT_TEMPERATURE_SENSOR_CONFIG();
-	/* Set (Min|Max)MeasuredValure */
-	sensor_cfg.temp_meas_cfg.min_value = zb_temperature_to_s16(ESP_TEMP_SENSOR_MIN_VALUE);
-	sensor_cfg.temp_meas_cfg.max_value = zb_temperature_to_s16(ESP_TEMP_SENSOR_MAX_VALUE);
+	esp_zb_init(&zb_nwk_cfg);
+
 	esp_zb_analog_output_cluster_cfg_t analog_cfg = {.out_of_service = false, .present_value = 0, .status_flags = 0};
-	esp_zb_ep_list_t *esp_zb_sensor_ep = custom_distance_sensor_ep_create(HA_ESP_SENSOR_ENDPOINT, &analog_cfg);
+	esp_zb_ep_list_t *esp_zb_sensor_ep = custom_distance_sensor_ep_create(&analog_cfg);
 
 	/* Register the device */
 	esp_zb_device_register(esp_zb_sensor_ep);
@@ -293,7 +308,8 @@ static void esp_zb_task(void *pvParameters)
 	};
 
 	esp_zb_zcl_update_reporting_info(&reporting_info);
-//	esp_zb_core_action_handler_register(zb_action_handler);
+
+	esp_zb_core_action_handler_register(zb_action_handler);
 	esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
 	ESP_ERROR_CHECK(esp_zb_start(false));
 

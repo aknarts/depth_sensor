@@ -43,52 +43,97 @@ float calculate_average(float values[], int count)
 
 _Noreturn void ultrasonic_task(void *pvParameters)
 {
-	float values[MAX_VALUES] = {0.0};
-	int currentIndex = 0;
-	int count = 0;
+    float values[MAX_VALUES] = {0.0};
+    int currentIndex = 0;
+    int count = 0;
 
-	while (true)
-	{
-		int32_t distance;
-		esp_err_t res = ultrasonic_measure_cm(&sensor, ESP_DIST_SENSOR_MAX_VALUE, &distance);
-		if (res != ESP_OK)
-		{
-			printf("Error %d: ", res);
-			switch (res)
-			{
-				case ESP_ERR_ULTRASONIC_PING:
-					ESP_LOGW(TAG, "Cannot ping (device is in invalid state)\n");
-					break;
-				case ESP_ERR_ULTRASONIC_PING_TIMEOUT:
-					ESP_LOGW(TAG, "Ping timeout (echo timeout)\n");
-					break;
-				case ESP_ERR_ULTRASONIC_ECHO_TIMEOUT:
-					ESP_LOGW(TAG, "Echo timeout (i.e. distance too big)\n");
-					break;
-				default:
-					ESP_LOGE(TAG, "%s\n", esp_err_to_name(res));
-			}
-		} else
-		{
-			ESP_LOGI(TAG, "Distance: %ld cm", distance);
-			values[currentIndex] = (float) distance;
-			currentIndex = (currentIndex + 1) % MAX_VALUES;
-			if (count < MAX_VALUES)
-			{
-				count++;
-			}
-			float fdistance = roundf(calculate_average(values, count));
-			ESP_LOGI(TAG, "Distance Average: %f cm", fdistance);
-			esp_zb_lock_acquire(portMAX_DELAY);
-			esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
-										 ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-										 ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &fdistance, false);
-			esp_zb_lock_release();
-		}
+    while (true)
+    {
+        int32_t distance = 0;
+        esp_err_t res = ESP_FAIL;
 
+        // Up to 3 attempts per cycle to cope with occasional bad states
+        for (int attempt = 0; attempt < 3; ++attempt)
+        {
+            ESP_LOGD(TAG, "Ultrasonic measure attempt %d/3", attempt + 1);
 
-		vTaskDelay(pdMS_TO_TICKS(ESP_DIST_SENSOR_UPDATE_INTERVAL * 1000));
-	}
+            res = ultrasonic_measure_cm(&sensor, ESP_DIST_SENSOR_MAX_VALUE, &distance);
+            if (res == ESP_OK)
+            {
+                ESP_LOGI(TAG, "Ultrasonic measure attempt %d succeeded: %ld cm", attempt + 1, distance);
+                break;
+            }
+
+            // If line is stuck or ping timed out, give sensor time to recover
+            if (res == ESP_ERR_ULTRASONIC_PING || res == ESP_ERR_ULTRASONIC_PING_TIMEOUT)
+            {
+                if (res == ESP_ERR_ULTRASONIC_PING)
+                {
+                    ESP_LOGW(TAG, "Attempt %d: echo line busy/stuck high; delaying 20ms and re-initializing pins",
+                             attempt + 1);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "Attempt %d: ping timeout (no rising edge); delaying 20ms and re-initializing pins",
+                             attempt + 1);
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+                // Re-init the pins in case line configuration/glitch happened
+                ultrasonic_init(&sensor);
+                ESP_LOGD(TAG, "Attempt %d: ultrasonic_init complete", attempt + 1);
+            }
+            else if (res == ESP_ERR_ULTRASONIC_ECHO_TIMEOUT)
+            {
+                // No target within range; break early to avoid hammering
+                ESP_LOGW(TAG, "Attempt %d: echo timeout (distance too large), ending attempt loop early",
+                         attempt + 1);
+                break;
+            }
+            else
+            {
+                ESP_LOGE(TAG, "Attempt %d: ultrasonic_measure_cm failed with error: %s",
+                         attempt + 1, esp_err_to_name(res));
+            }
+        }
+
+        if (res != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Ultrasonic measurement failed after 3 attempts");
+            switch (res)
+            {
+                case ESP_ERR_ULTRASONIC_PING:
+                    ESP_LOGW(TAG, "Cannot ping (echo line busy/stuck high)");
+                    break;
+                case ESP_ERR_ULTRASONIC_PING_TIMEOUT:
+                    ESP_LOGW(TAG, "Ping timeout (no rising edge)");
+                    break;
+                case ESP_ERR_ULTRASONIC_ECHO_TIMEOUT:
+                    ESP_LOGW(TAG, "Echo timeout (distance too large)");
+                    break;
+                default:
+                    ESP_LOGE(TAG, "%s", esp_err_to_name(res));
+            }
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Distance: %ld cm", distance);
+            values[currentIndex] = (float)distance;
+            currentIndex = (currentIndex + 1) % MAX_VALUES;
+            if (count < MAX_VALUES) count++;
+
+            // Simple averaging; consider median for better outlier rejection
+            float fdistance = roundf(calculate_average(values, count));
+            ESP_LOGI(TAG, "Distance Average: %f cm", fdistance);
+
+            esp_zb_lock_acquire(portMAX_DELAY);
+            esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
+                                         ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                         ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &fdistance, false);
+            esp_zb_lock_release();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(ESP_DIST_SENSOR_UPDATE_INTERVAL * 1000));
+    }
 }
 
 
@@ -276,6 +321,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 				break;
 			case ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY:
 				xTaskCreate(esp_zb_identify, "Identify", 4096, NULL, 5, NULL);
+				break;
 			default:
 				ESP_LOGI(TAG, "Message data: cluster(0x%x), attribute(0x%x)  ", message->info.cluster,
 						 message->attribute.id);
@@ -447,16 +493,37 @@ static void esp_zb_task(void *pvParameters)
 			.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT,
 			.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
 			.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+			/* Periodic reporting: every 1..10 seconds */
 			.u.send_info.min_interval = 1,
-			.u.send_info.max_interval = 0,
+			.u.send_info.max_interval = 10,
 			.u.send_info.def_min_interval = 1,
-			.u.send_info.def_max_interval = 0,
-			.u.send_info.delta.u16 = 100,
+			.u.send_info.def_max_interval = 10,
+			/* Neutralize delta to avoid type mismatch on float attribute; rely on periodic updates */
+			.u.send_info.delta.u16 = 0,
 			.attr_id = ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID,
 			.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
 	};
 
 	esp_zb_zcl_update_reporting_info(&reporting_info);
+
+	/* Also configure periodic reporting for Temperature Measurement (s16: value = degC * 100) */
+	esp_zb_zcl_reporting_info_t temp_reporting_info = {
+			.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+			.ep = HA_ESP_SENSOR_ENDPOINT,
+			.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+			.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+			.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+			/* Report every 30..300 seconds, or when change >= 0.5°C (50 in 0.01°C units) */
+			.u.send_info.min_interval = 30,
+			.u.send_info.max_interval = 300,
+			.u.send_info.def_min_interval = 30,
+			.u.send_info.def_max_interval = 300,
+			.u.send_info.delta.u16 = 50,
+			.attr_id = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+			.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+	};
+
+	esp_zb_zcl_update_reporting_info(&temp_reporting_info);
 
 	esp_zb_core_action_handler_register(zb_action_handler);
 	esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);

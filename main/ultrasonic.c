@@ -10,84 +10,97 @@
 #include "ultrasonic.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <sys/time.h>
+#include <esp_timer.h>
 #include <esp_log.h>
 
-#define TRIGGER_LOW_DELAY 4
-#define TRIGGER_HIGH_DELAY 20
-#define PING_TIMEOUT 6000
-#define ROUNDTRIP 58
+#define TRIGGER_LOW_DELAY_US   4      // us
+#define TRIGGER_HIGH_DELAY_US  10     // us (10us pulse is standard)
+#define BLANKING_DELAY_US      200    // us, allow transducer ring-down before listening
+#define WAIT_FOR_ECHO_HIGH_US  8000   // us, time to see echo rising edge
+#define ROUNDTRIP_US_PER_CM    58     // us for round trip ~ 58us/cm (speed of sound ~343m/s)
 
-static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-
-static inline uint32_t get_time_us()
+static inline uint64_t now_us(void)
 {
-	struct timeval tv;
-	gettimeofday(&tv, NULL);
-	return tv.tv_usec;
+    return (uint64_t)esp_timer_get_time(); // monotonic, microseconds
 }
 
-#define timeout_expired(start, len) ((uint32_t)(get_time_us() - (start)) >= (len))
-
-#define RETURN_CRTCAL(MUX, RES) do { portEXIT_CRITICAL(&MUX); return RES; } while(0)
+static inline bool expired_since(uint64_t start_us, uint64_t limit_us)
+{
+    return (now_us() - start_us) >= limit_us;
+}
 
 void ultrasonic_init(const ultrasonic_sensor_t *dev)
 {
-	gpio_reset_pin(dev->trigger_pin);
-	gpio_reset_pin(dev->echo_pin);
-	gpio_set_direction(dev->trigger_pin, GPIO_MODE_OUTPUT);
-	gpio_set_direction(dev->echo_pin, GPIO_MODE_INPUT);
+    // Ensure clean, deterministic GPIO state
+    gpio_reset_pin(dev->trigger_pin);
+    gpio_reset_pin(dev->echo_pin);
 
-	gpio_set_level(dev->trigger_pin, 0);
+    // Trigger as push-pull output, idle low
+    gpio_set_direction(dev->trigger_pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(dev->trigger_pin, 0);
+
+    // Echo as input with pulldown to keep stable LOW when sensor idle
+    gpio_set_direction(dev->echo_pin, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(dev->echo_pin, GPIO_PULLDOWN_ONLY);
 }
 
 esp_err_t ultrasonic_measure_cm(const ultrasonic_sensor_t *dev, uint32_t max_distance, int32_t *distance)
 {
-	if (!distance)
-		return ESP_ERR_INVALID_ARG;
+    if (!distance) return ESP_ERR_INVALID_ARG;
 
-	portENTER_CRITICAL(&mux);
+    // Calculate the maximum high time we expect on the echo line for the given max_distance
+    const uint32_t max_echo_high_us = max_distance * ROUNDTRIP_US_PER_CM;
 
-	// Ping: Low for 2..4 us, then high 10 us
-	gpio_set_level(dev->trigger_pin, 0);
-	esp_rom_delay_us(TRIGGER_LOW_DELAY);
-	gpio_set_level(dev->trigger_pin, 1);
-	esp_rom_delay_us(TRIGGER_HIGH_DELAY);
-	gpio_set_level(dev->trigger_pin, 0);
+    // 1) Ensure echo is LOW before we start a new ping (previous ping ended)
+    uint64_t t0 = now_us();
+    while (gpio_get_level(dev->echo_pin))
+    {
+        if (expired_since(t0, WAIT_FOR_ECHO_HIGH_US)) // reuse as a "settle low" timeout
+            return ESP_ERR_ULTRASONIC_PING; // still high -> device/bus stuck or previous ping not finished
+    }
 
-	// Previous ping isn't ended
-	if (gpio_get_level(dev->echo_pin))
-		RETURN_CRTCAL(mux, ESP_ERR_ULTRASONIC_PING);
+    // 2) Send trigger pulse
+    gpio_set_level(dev->trigger_pin, 0);
+    esp_rom_delay_us(TRIGGER_LOW_DELAY_US);
+    gpio_set_level(dev->trigger_pin, 1);
+    esp_rom_delay_us(TRIGGER_HIGH_DELAY_US);
+    gpio_set_level(dev->trigger_pin, 0);
 
-	// Wait for echo
-	uint32_t start = get_time_us();
-	while (!gpio_get_level(dev->echo_pin))
-	{
-		if (timeout_expired(start, PING_TIMEOUT))
-		{
-			portEXIT_CRITICAL(&mux);
-			return ESP_ERR_ULTRASONIC_PING_TIMEOUT;
-		}
-	}
+    // Optional: small blanking time to let the waterproof transducer ring down
+    esp_rom_delay_us(BLANKING_DELAY_US);
 
-	// got echo, measuring
-	uint32_t echo_start = get_time_us();
-	uint32_t time = echo_start;
-	while (gpio_get_level(dev->echo_pin))
-	{
-		time = get_time_us();
-	}
-	portEXIT_CRITICAL(&mux);
+    // 3) Wait for echo to go HIGH (start of measurement)
+    t0 = now_us();
+    while (!gpio_get_level(dev->echo_pin))
+    {
+        if (expired_since(t0, WAIT_FOR_ECHO_HIGH_US))
+            return ESP_ERR_ULTRASONIC_PING_TIMEOUT; // no rising edge seen
+    }
 
-	uint32_t temp = (time - echo_start) / ROUNDTRIP;
+    // 4) Measure how long echo stays HIGH
+    const uint64_t echo_start = now_us();
+    uint64_t echo_end = echo_start;
 
-	if (temp > max_distance)
-	{
-		portEXIT_CRITICAL(&mux);
-		return ESP_ERR_ULTRASONIC_ECHO_TIMEOUT;
-	}
+    while (gpio_get_level(dev->echo_pin))
+    {
+        echo_end = now_us();
+        // Add timeout so we don't hang if line gets stuck HIGH
+        if (expired_since(echo_start, max_echo_high_us + 2000 /* small margin */))
+            break;
+    }
 
-	*distance = (int32_t) temp;
+    // Compute duration
+    const uint64_t dt_us = (echo_end > echo_start) ? (echo_end - echo_start) : 0;
 
-	return ESP_OK;
+    // 5) Convert to cm
+    const uint32_t cm = (uint32_t)(dt_us / ROUNDTRIP_US_PER_CM);
+
+    if (cm == 0 && dt_us == 0)
+        return ESP_ERR_ULTRASONIC_PING_TIMEOUT;
+
+    if (cm > max_distance)
+        return ESP_ERR_ULTRASONIC_ECHO_TIMEOUT;
+
+    *distance = (int32_t)cm;
+    return ESP_OK;
 }

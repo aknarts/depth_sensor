@@ -7,6 +7,7 @@
  * Copyright (C) 2016, 2018 Ruslan V. Uss <unclerus@gmail.com>
  * BSD Licensed as described in the file LICENSE
  */
+
 #ifndef __ULTRASONIC_H__
 #define __ULTRASONIC_H__
 

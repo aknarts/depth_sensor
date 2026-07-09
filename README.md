@@ -42,6 +42,21 @@ Notes:
 ## ESP‑IDF Setup
 
 Prerequisites:
-- ESP‑IDF 5.5.x installed with required tools; verified with IDF 5.5.4.
+- ESP‑IDF 6.0.x installed with required tools; verified with IDF 6.0.2.
 
-Build and flash:
+Build-only verification:
+
+```sh
+. /path/to/esp-idf/export.sh
+./scripts/verify-build.sh
+```
+
+The script runs `idf.py -B "${BUILD_DIR:-build}" build`. Set `BUILD_DIR=build-ci` to use a separate local build directory. GitHub Actions runs the same build gate on pushes and pull requests using the ESP-IDF 6.0.2 container.
+
+Hardware validation:
+
+```sh
+idf.py -p /dev/ttyUSB0 flash monitor
+```
+
+Adjust the serial device as needed, then verify depth readings, temperature reports, Zigbee join behavior, and LED attribute handling in the monitor logs.

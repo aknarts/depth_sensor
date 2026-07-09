@@ -1,4 +1,5 @@
 .idea
 build
+build-*
 sdkconfig.old
 managed_components

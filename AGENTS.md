@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is an ESP-IDF firmware project for an ESP32-C6 Zigbee depth sensor. Root-level build and configuration files include `CMakeLists.txt`, `sdkconfig`, `partitions.csv`, `dependencies.lock`, and `main/idf_component.yml`. Firmware source lives in `main/`:
+This is an ESP-IDF firmware project for an ESP32-C6 Zigbee depth sensor. Root-level build and configuration files include `CMakeLists.txt`, `sdkconfig`, `partitions.csv`, `dependencies.lock`, and `main/idf_component.yml`. CI lives in `.github/workflows/`. Firmware source lives in `main/`:
 
 - `main/depth_sensor.c` and `.h`: Zigbee endpoint, ADC depth reporting, commissioning, and attribute handling.
 - `main/light_driver.c` and `.h`: onboard LED control exposed through Zigbee light clusters.
@@ -11,10 +11,11 @@ This is an ESP-IDF firmware project for an ESP32-C6 Zigbee depth sensor. Root-le
 
 ## Build, Test, and Development Commands
 
-Use ESP-IDF 5.x with the environment loaded before running commands.
+Use ESP-IDF 6.0.x with the environment loaded before running commands.
 
 - `idf.py set-target esp32c6`: configure the target MCU.
-- `idf.py build`: compile firmware and resolve managed components.
+- `./scripts/verify-build.sh`: compile firmware with `idf.py build`; set `BUILD_DIR=build-ci` to use a separate build directory.
+- `idf.py build`: compile firmware directly and resolve managed components.
 - `idf.py -p /dev/ttyUSB0 flash monitor`: flash a connected board and stream logs; adjust the serial device as needed.
 - `idf.py menuconfig`: update ESP-IDF configuration stored in `sdkconfig`.
 - `idf.py clean`: remove build outputs while keeping configuration.
@@ -25,7 +26,7 @@ Write C in the existing ESP-IDF style and match surrounding formatting when edit
 
 ## Testing Guidelines
 
-No automated test suite is currently present. At minimum, run `idf.py build` before submitting changes. For behavior changes, flash hardware and verify logs with `idf.py -p /dev/ttyUSB0 flash monitor`. Check depth readings, temperature reports, Zigbee join behavior, and LED attribute handling. If adding tests later, place them in an ESP-IDF-compatible test component and document the exact command here.
+No automated test suite is currently present. At minimum, run `./scripts/verify-build.sh` before submitting changes; GitHub Actions runs the same build-only gate on pushes and pull requests. For behavior changes, flash hardware and verify logs with `idf.py -p /dev/ttyUSB0 flash monitor`. Check depth readings, temperature reports, Zigbee join behavior, and LED attribute handling. If adding tests later, place them in an ESP-IDF-compatible test component and document the exact command here.
 
 ## Commit & Pull Request Guidelines
 

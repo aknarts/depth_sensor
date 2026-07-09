@@ -5,6 +5,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_err.h>
+#include "depth_math.h"
 #include "depth_sensor.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -18,9 +19,9 @@
 
 //TODO: https://github.com/Koenkk/zigbee2mqtt/issues/18321
 
-#define PRESSURE_RANGE_MM 5000
-#define SENSE_RESISTOR_OHMS 120
-#define ADC_VREF_MV 3300
+#define SENSOR_ADC_ATTEN ADC_ATTEN_DB_12
+#define SENSOR_ADC_BITWIDTH ADC_BITWIDTH_12
+#define SENSOR_ADC_APPROX_FULL_SCALE_MV 3300
 
 // Select the ADC1 channel your sensor output is wired to
 // Adjust as needed for your board's ADC-capable pinout
@@ -102,19 +103,19 @@ _Noreturn void pressure_task(void *pvParameters)
             if (adc_cali_raw_to_voltage(s_adc_cali_handle, raw, &voltage_mv) != ESP_OK)
             {
                 ESP_LOGW(TAG, "ADC calibration conversion failed, using approximation");
-                voltage_mv = (int)((uint64_t)raw  / 1024.0f*ADC_VREF_MV);
+                voltage_mv = depth_sensor_raw_to_voltage_mv_approx(
+                    raw, SENSOR_ADC_BITWIDTH, SENSOR_ADC_APPROX_FULL_SCALE_MV);
             }
         }
         else
         {
-            // Approximate conversion assuming 11 dB attenuation full-scale near 3.3V
-            voltage_mv = (int)((uint64_t)raw / 1024.0f*ADC_VREF_MV);
+            // Approximate linear conversion for 12 dB attenuation near a 3.3 V full-scale input.
+            voltage_mv = depth_sensor_raw_to_voltage_mv_approx(
+                raw, SENSOR_ADC_BITWIDTH, SENSOR_ADC_APPROX_FULL_SCALE_MV);
         }
 
-        float current_mA = (float)voltage_mv / (float)SENSE_RESISTOR_OHMS; // Sense resistor 120Ω
-        float depth_mm = (current_mA - 4.0f) * ((float)PRESSURE_RANGE_MM / 16.0f); // 4–20 mA spans full range
-        if (depth_mm < 0.0f) depth_mm = 0.0f;
-        if (depth_mm > (float)PRESSURE_RANGE_MM) depth_mm = (float)PRESSURE_RANGE_MM;
+        float current_mA = depth_sensor_voltage_to_current_ma(voltage_mv);
+        float depth_mm = depth_sensor_voltage_to_depth_mm(voltage_mv);
 
         // Keep millimeters for Zigbee reporting.
         float depth_mm_rounded = roundf(depth_mm);
@@ -169,8 +170,8 @@ static esp_err_t deferred_driver_init(void)
 
 	// Configure selected channel with 12 dB attenuation (approx. up to ~3.3V)
 	adc_oneshot_chan_cfg_t chan_cfg = {
-			.bitwidth = ADC_BITWIDTH_DEFAULT,
-			.atten = ADC_ATTEN_DB_12,
+			.bitwidth = SENSOR_ADC_BITWIDTH,
+			.atten = SENSOR_ADC_ATTEN,
 	};
 	s_adc_channel = SENSOR_ADC_CHANNEL;
 	ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, s_adc_channel, &chan_cfg));
@@ -178,8 +179,8 @@ static esp_err_t deferred_driver_init(void)
 	// Try to enable calibration (curve fitting scheme)
 	adc_cali_curve_fitting_config_t cali_config = {
 			.unit_id = ADC_UNIT_1,
-			.atten = ADC_ATTEN_DB_12,
-			.bitwidth = ADC_BITWIDTH_DEFAULT,
+			.atten = SENSOR_ADC_ATTEN,
+			.bitwidth = SENSOR_ADC_BITWIDTH,
 	};
 	if (adc_cali_create_scheme_curve_fitting(&cali_config, &s_adc_cali_handle) == ESP_OK) {
 		s_adc_cali_enabled = true;

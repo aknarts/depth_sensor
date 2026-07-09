@@ -28,7 +28,7 @@ Notes:
 - Depth is reported as 0–5000 millimeters (mm) to Zigbee.
 
 ## Firmware behavior
-- ADC oneshot driver is used with 11 dB attenuation and calibration when available.
+- ADC oneshot driver is used with 12 dB attenuation and calibration when available.
 - Depth is sampled once per second, averaged over the last 10 samples, and published to the Analog Output cluster.
 - Temperature is reported via the Temperature Measurement cluster with a default report interval.
 

@@ -157,6 +157,26 @@ static void esp_app_temp_sensor_handler(float temperature)
 	esp_zb_lock_release();
 }
 
+static esp_err_t create_app_task(TaskFunction_t task_function, const char *task_name,
+								 configSTACK_DEPTH_TYPE stack_depth, void *task_arg,
+								 UBaseType_t priority, TaskHandle_t *task_handle)
+{
+	if (!task_function || !task_name)
+	{
+		ESP_LOGE(TAG, "Invalid task configuration");
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	BaseType_t task_created = xTaskCreate(task_function, task_name, stack_depth, task_arg, priority, task_handle);
+	if (task_created != pdPASS)
+	{
+		ESP_LOGE(TAG, "Failed to start task %s: xTaskCreate returned %ld", task_name, (long) task_created);
+		return ESP_ERR_NO_MEM;
+	}
+
+	return ESP_OK;
+}
+
 static esp_err_t deferred_driver_init(void)
 {
 	light_driver_init(LIGHT_DEFAULT_OFF);
@@ -166,7 +186,8 @@ static esp_err_t deferred_driver_init(void)
 			.unit_id = ADC_UNIT_1,
 			.ulp_mode = ADC_ULP_MODE_DISABLE,
 	};
-	ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &s_adc_handle));
+	ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&init_config, &s_adc_handle),
+						TAG, "Failed to initialize ADC oneshot unit");
 
 	// Configure selected channel with 12 dB attenuation (approx. up to ~3.3V)
 	adc_oneshot_chan_cfg_t chan_cfg = {
@@ -174,7 +195,8 @@ static esp_err_t deferred_driver_init(void)
 			.atten = SENSOR_ADC_ATTEN,
 	};
 	s_adc_channel = SENSOR_ADC_CHANNEL;
-	ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, s_adc_channel, &chan_cfg));
+	ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc_handle, s_adc_channel, &chan_cfg),
+						TAG, "Failed to configure ADC channel");
 
 	// Try to enable calibration (curve fitting scheme)
 	adc_cali_curve_fitting_config_t cali_config = {
@@ -190,7 +212,9 @@ static esp_err_t deferred_driver_init(void)
 		ESP_LOGW(TAG, "ADC calibration not available; using approximate conversion");
 	}
 
-	xTaskCreate(pressure_task, "pressure_task", configMINIMAL_STACK_SIZE * 3, NULL, 5, NULL);
+	ESP_RETURN_ON_ERROR(create_app_task(pressure_task, "pressure_task",
+										configMINIMAL_STACK_SIZE * 3, NULL, 5, NULL),
+						TAG, "Failed to start pressure sensor task");
 
 	temperature_sensor_config_t temp_sensor_config =
 			TEMPERATURE_SENSOR_CONFIG_DEFAULT(ESP_TEMP_SENSOR_MIN_VALUE, ESP_TEMP_SENSOR_MAX_VALUE);
@@ -216,7 +240,13 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 		case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
 			if (err_status == ESP_OK)
 			{
-				ESP_LOGI(TAG, "Deferred driver initialization %s", deferred_driver_init() ? "failed" : "successful");
+				esp_err_t init_status = deferred_driver_init();
+				if (init_status != ESP_OK)
+				{
+					ESP_LOGE(TAG, "Deferred driver initialization failed: %s", esp_err_to_name(init_status));
+					break;
+				}
+				ESP_LOGI(TAG, "Deferred driver initialization successful");
 				ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
 				if (esp_zb_bdb_is_factory_new())
 				{
@@ -379,7 +409,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 				}
 				break;
 			case ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY:
-				xTaskCreate(esp_zb_identify, "Identify", 4096, NULL, 5, NULL);
+				ret = create_app_task(esp_zb_identify, "Identify", 4096, NULL, 5, NULL);
 				break;
 			default:
 				ESP_LOGI(TAG, "Message data: cluster(0x%x), attribute(0x%x)  ", message->info.cluster,
@@ -599,5 +629,5 @@ void app_main(void)
 	};
 	ESP_ERROR_CHECK(nvs_flash_init());
 	ESP_ERROR_CHECK(esp_zb_platform_config(&config));
-	xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+	ESP_ERROR_CHECK(create_app_task(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL));
 }

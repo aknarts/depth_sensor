@@ -16,6 +16,7 @@
 
 #include "esp_err.h"
 #include "esp_check.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -54,6 +55,17 @@ static void temp_sensor_driver_value_update(void *arg)
     }
 }
 
+static esp_err_t temp_sensor_driver_task_start(void)
+{
+    BaseType_t task_created = xTaskCreate(temp_sensor_driver_value_update, "sensor_update", 2048, NULL, 10, NULL);
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start task sensor_update: xTaskCreate returned %ld", (long)task_created);
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
 /**
  * @brief init temperature sensor
  *
@@ -65,16 +77,20 @@ static esp_err_t temp_sensor_driver_sensor_init(temperature_sensor_config_t *con
                         TAG, "Fail to install on-chip temperature sensor");
     ESP_RETURN_ON_ERROR(temperature_sensor_enable(temp_sensor),
                         TAG, "Fail to enable on-chip temperature sensor");
-    return (xTaskCreate(temp_sensor_driver_value_update, "sensor_update", 2048, NULL, 10, NULL) == pdTRUE) ? ESP_OK : ESP_FAIL;
+    return ESP_OK;
 }
 
 esp_err_t temp_sensor_driver_init(temperature_sensor_config_t *config, uint16_t update_interval,
                              esp_temp_sensor_callback_t cb)
 {
-    if (ESP_OK != temp_sensor_driver_sensor_init(config)) {
-        return ESP_FAIL;
-    }
+    ESP_RETURN_ON_FALSE(config, ESP_ERR_INVALID_ARG, TAG, "Temperature sensor config is required");
+    ESP_RETURN_ON_FALSE(update_interval > 0, ESP_ERR_INVALID_ARG, TAG,
+                        "Temperature sensor update interval must be greater than zero");
+    ESP_RETURN_ON_ERROR(temp_sensor_driver_sensor_init(config), TAG,
+                        "Failed to initialize on-chip temperature sensor");
+
     func_ptr = cb;
     interval = update_interval;
+    ESP_RETURN_ON_ERROR(temp_sensor_driver_task_start(), TAG, "Failed to start temperature polling task");
     return ESP_OK;
 }

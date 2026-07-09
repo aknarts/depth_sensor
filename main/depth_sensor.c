@@ -116,7 +116,7 @@ _Noreturn void pressure_task(void *pvParameters)
         if (depth_mm < 0.0f) depth_mm = 0.0f;
         if (depth_mm > (float)PRESSURE_RANGE_MM) depth_mm = (float)PRESSURE_RANGE_MM;
 
-        // Keep millimeters for Zigbee reporting
+        // Keep millimeters for Zigbee reporting.
         float depth_mm_rounded = roundf(depth_mm);
 
         values[currentIndex] = depth_mm_rounded;
@@ -125,7 +125,8 @@ _Noreturn void pressure_task(void *pvParameters)
 
         float avg_mm = roundf(calculate_average(values, count));
 
-        ESP_LOGI(TAG, "Depth: raw=%d, %d mV, %.2f mA, %.0f mm (avg %.0f mm)", raw, voltage_mv, current_mA, depth_mm_rounded, avg_mm);
+        ESP_LOGI(TAG, "Depth: raw=%d, %d mV, %.2f mA, %.0f mm (avg %.0f mm)",
+                 raw, voltage_mv, current_mA, depth_mm_rounded, avg_mm);
 
         esp_zb_lock_acquire(portMAX_DELAY);
         esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,

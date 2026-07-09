@@ -16,7 +16,7 @@
 
 /* Distance sendor configuration */
 #define ESP_DIST_SENSOR_UPDATE_INTERVAL (1)     /* Local sensor update interval (second) */
-#define ESP_DIST_SENSOR_MAX_VALUE       (600)    /* Local sensor max measured value (cm) */
+#define ESP_DIST_SENSOR_MAX_VALUE       (5000)   /* Local sensor max measured value (mm) */
 
 
 /* Temperature sensor configuration */

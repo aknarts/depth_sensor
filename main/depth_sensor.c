@@ -1,9 +1,9 @@
 #include <sys/cdefs.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <math.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <ultrasonic.h>
 #include <esp_err.h>
 #include "depth_sensor.h"
 #include "esp_check.h"
@@ -11,20 +11,31 @@
 #include "nvs_flash.h"
 #include "temp_sensor_driver.h"
 #include "ha/esp_zigbee_ha_standard.h"
+#include "driver/gpio.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 
 //TODO: https://github.com/Koenkk/zigbee2mqtt/issues/18321
 
-#define TRIGGER_GPIO 7
-#define ECHO_GPIO 14
+#define PRESSURE_RANGE_MM 5000
+#define SENSE_RESISTOR_OHMS 120
+#define ADC_VREF_MV 3300
 
-#define MAX_VALUES 10
+// Select the ADC1 channel your sensor output is wired to
+// Adjust as needed for your board's ADC-capable pinout
+// ADC1_CH6 corresponds to ADC_CHANNEL_6 in the oneshot API
+#define SENSOR_ADC_CHANNEL ADC_CHANNEL_6
 
-static ultrasonic_sensor_t sensor = {
-		.trigger_pin = TRIGGER_GPIO,
-		.echo_pin = ECHO_GPIO
-};
+#define MAX_VALUES 20
 
 static const char *TAG = "ESP_ZB_DIST_SENSOR";
+
+// ADC oneshot driver and calibration handles
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;
+static adc_cali_handle_t s_adc_cali_handle = NULL;
+static bool s_adc_cali_enabled = false;
+static adc_channel_t s_adc_channel = SENSOR_ADC_CHANNEL;
 
 static int16_t zb_temperature_to_s16(float temp)
 {
@@ -41,96 +52,86 @@ float calculate_average(float values[], int count)
 	return sum / count;
 }
 
-_Noreturn void ultrasonic_task(void *pvParameters)
+_Noreturn void pressure_task(void *pvParameters)
 {
-    float values[MAX_VALUES] = {0.0};
+    float values[MAX_VALUES] = {0.0f};
     int currentIndex = 0;
     int count = 0;
 
     while (true)
     {
-        int32_t distance = 0;
-        esp_err_t res = ESP_FAIL;
+        int voltage_mv = 0;
 
-        // Up to 3 attempts per cycle to cope with occasional bad states
-        for (int attempt = 0; attempt < 3; ++attempt)
-        {
-            ESP_LOGD(TAG, "Ultrasonic measure attempt %d/3", attempt + 1);
-
-            res = ultrasonic_measure_cm(&sensor, ESP_DIST_SENSOR_MAX_VALUE, &distance);
-            if (res == ESP_OK)
-            {
-                ESP_LOGI(TAG, "Ultrasonic measure attempt %d succeeded: %ld cm", attempt + 1, distance);
-                break;
-            }
-
-            // If line is stuck or ping timed out, give sensor time to recover
-            if (res == ESP_ERR_ULTRASONIC_PING || res == ESP_ERR_ULTRASONIC_PING_TIMEOUT)
-            {
-                if (res == ESP_ERR_ULTRASONIC_PING)
-                {
-                    ESP_LOGW(TAG, "Attempt %d: echo line busy/stuck high; delaying 20ms and re-initializing pins",
-                             attempt + 1);
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "Attempt %d: ping timeout (no rising edge); delaying 20ms and re-initializing pins",
-                             attempt + 1);
-                }
-                vTaskDelay(pdMS_TO_TICKS(20));
-                // Re-init the pins in case line configuration/glitch happened
-                ultrasonic_init(&sensor);
-                ESP_LOGD(TAG, "Attempt %d: ultrasonic_init complete", attempt + 1);
-            }
-            else if (res == ESP_ERR_ULTRASONIC_ECHO_TIMEOUT)
-            {
-                // No target within range; break early to avoid hammering
-                ESP_LOGW(TAG, "Attempt %d: echo timeout (distance too large), ending attempt loop early",
-                         attempt + 1);
-                break;
-            }
-            else
-            {
-                ESP_LOGE(TAG, "Attempt %d: ultrasonic_measure_cm failed with error: %s",
-                         attempt + 1, esp_err_to_name(res));
-            }
-        }
-
+        // Take multiple samples and compute a trimmed mean (drop min and max) to suppress outliers
+        const int NSAMPLES = 8;
+        int raw_first = 0;
+        esp_err_t res = adc_oneshot_read(s_adc_handle, s_adc_channel, &raw_first);
         if (res != ESP_OK)
         {
-            ESP_LOGW(TAG, "Ultrasonic measurement failed after 3 attempts");
-            switch (res)
+            ESP_LOGW(TAG, "ADC read failed: %s", esp_err_to_name(res));
+            vTaskDelay(pdMS_TO_TICKS(ESP_DIST_SENSOR_UPDATE_INTERVAL * 1000));
+            continue;
+        }
+        int sum_raw = raw_first;
+        int min_raw = raw_first;
+        int max_raw = raw_first;
+        bool all_ok = true;
+        for (int i = 1; i < NSAMPLES; ++i)
+        {
+            int r = 0;
+            res = adc_oneshot_read(s_adc_handle, s_adc_channel, &r);
+            if (res != ESP_OK)
             {
-                case ESP_ERR_ULTRASONIC_PING:
-                    ESP_LOGW(TAG, "Cannot ping (echo line busy/stuck high)");
-                    break;
-                case ESP_ERR_ULTRASONIC_PING_TIMEOUT:
-                    ESP_LOGW(TAG, "Ping timeout (no rising edge)");
-                    break;
-                case ESP_ERR_ULTRASONIC_ECHO_TIMEOUT:
-                    ESP_LOGW(TAG, "Echo timeout (distance too large)");
-                    break;
-                default:
-                    ESP_LOGE(TAG, "%s", esp_err_to_name(res));
+                ESP_LOGW(TAG, "ADC read failed (sample %d/%d): %s", i + 1, NSAMPLES, esp_err_to_name(res));
+                all_ok = false;
+                break;
+            }
+            sum_raw += r;
+            if (r < min_raw) min_raw = r;
+            if (r > max_raw) max_raw = r;
+        }
+        if (!all_ok)
+        {
+            vTaskDelay(pdMS_TO_TICKS(ESP_DIST_SENSOR_UPDATE_INTERVAL * 1000));
+            continue;
+        }
+        int raw = (sum_raw - min_raw - max_raw) / (NSAMPLES - 2);
+
+        if (s_adc_cali_enabled)
+        {
+            if (adc_cali_raw_to_voltage(s_adc_cali_handle, raw, &voltage_mv) != ESP_OK)
+            {
+                ESP_LOGW(TAG, "ADC calibration conversion failed, using approximation");
+                voltage_mv = (int)((uint64_t)raw  / 1024.0f*ADC_VREF_MV);
             }
         }
         else
         {
-            ESP_LOGI(TAG, "Distance: %ld cm", distance);
-            values[currentIndex] = (float)distance;
-            currentIndex = (currentIndex + 1) % MAX_VALUES;
-            if (count < MAX_VALUES) count++;
-
-            // Simple averaging; consider median for better outlier rejection
-            float fdistance = roundf(calculate_average(values, count));
-            ESP_LOGI(TAG, "Distance Average: %f cm", fdistance);
-
-            esp_zb_lock_acquire(portMAX_DELAY);
-            esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
-                                         ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                         ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &fdistance, false);
-            esp_zb_lock_release();
+            // Approximate conversion assuming 11 dB attenuation full-scale near 3.3V
+            voltage_mv = (int)((uint64_t)raw / 1024.0f*ADC_VREF_MV);
         }
+
+        float current_mA = (float)voltage_mv / (float)SENSE_RESISTOR_OHMS; // Sense resistor 120Ω
+        float depth_mm = (current_mA - 4.0f) * ((float)PRESSURE_RANGE_MM / 16.0f); // 4–20 mA spans full range
+        if (depth_mm < 0.0f) depth_mm = 0.0f;
+        if (depth_mm > (float)PRESSURE_RANGE_MM) depth_mm = (float)PRESSURE_RANGE_MM;
+
+        // Keep millimeters for Zigbee reporting
+        float depth_mm_rounded = roundf(depth_mm);
+
+        values[currentIndex] = depth_mm_rounded;
+        currentIndex = (currentIndex + 1) % MAX_VALUES;
+        if (count < MAX_VALUES) count++;
+
+        float avg_mm = roundf(calculate_average(values, count));
+
+        ESP_LOGI(TAG, "Depth: raw=%d, %d mV, %.2f mA, %.0f mm (avg %.0f mm)", raw, voltage_mv, current_mA, depth_mm_rounded, avg_mm);
+
+        esp_zb_lock_acquire(portMAX_DELAY);
+        esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
+                                     ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                                     ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &avg_mm, false);
+        esp_zb_lock_release();
 
         vTaskDelay(pdMS_TO_TICKS(ESP_DIST_SENSOR_UPDATE_INTERVAL * 1000));
     }
@@ -156,9 +157,39 @@ static void esp_app_temp_sensor_handler(float temperature)
 
 static esp_err_t deferred_driver_init(void)
 {
-	ultrasonic_init(&sensor);
 	light_driver_init(LIGHT_DEFAULT_OFF);
-	xTaskCreate(ultrasonic_task, "ultrasonic_task", configMINIMAL_STACK_SIZE * 3, NULL, 5, NULL);
+
+	// Initialize ADC Oneshot driver (Unit 1)
+	adc_oneshot_unit_init_cfg_t init_config = {
+			.unit_id = ADC_UNIT_1,
+			.ulp_mode = ADC_ULP_MODE_DISABLE,
+	};
+	ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &s_adc_handle));
+
+	// Configure selected channel with 12 dB attenuation (approx. up to ~3.3V)
+	adc_oneshot_chan_cfg_t chan_cfg = {
+			.bitwidth = ADC_BITWIDTH_DEFAULT,
+			.atten = ADC_ATTEN_DB_12,
+	};
+	s_adc_channel = SENSOR_ADC_CHANNEL;
+	ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, s_adc_channel, &chan_cfg));
+
+	// Try to enable calibration (curve fitting scheme)
+	adc_cali_curve_fitting_config_t cali_config = {
+			.unit_id = ADC_UNIT_1,
+			.atten = ADC_ATTEN_DB_12,
+			.bitwidth = ADC_BITWIDTH_DEFAULT,
+	};
+	if (adc_cali_create_scheme_curve_fitting(&cali_config, &s_adc_cali_handle) == ESP_OK) {
+		s_adc_cali_enabled = true;
+		ESP_LOGI(TAG, "ADC calibration enabled (curve fitting)");
+	} else {
+		s_adc_cali_enabled = false;
+		ESP_LOGW(TAG, "ADC calibration not available; using approximate conversion");
+	}
+
+	xTaskCreate(pressure_task, "pressure_task", configMINIMAL_STACK_SIZE * 3, NULL, 5, NULL);
+
 	temperature_sensor_config_t temp_sensor_config =
 			TEMPERATURE_SENSOR_CONFIG_DEFAULT(ESP_TEMP_SENSOR_MIN_VALUE, ESP_TEMP_SENSOR_MAX_VALUE);
 	ESP_RETURN_ON_ERROR(

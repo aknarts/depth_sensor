@@ -277,6 +277,33 @@ static void esp_zb_identify(void *pvParameters)
 	vTaskDelete(NULL);
 }
 
+static bool read_local_u16_attr(uint8_t endpoint, uint16_t cluster_id, uint16_t attr_id, uint16_t *value)
+{
+	esp_zb_zcl_attr_t *attr = esp_zb_zcl_get_attribute(endpoint, cluster_id, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, attr_id);
+	if (!value || !attr || attr->type != ESP_ZB_ZCL_ATTR_TYPE_U16 || !attr->data_p)
+	{
+		ESP_LOGW(TAG, "Missing local u16 attribute: endpoint(%d), cluster(0x%x), attribute(0x%x)",
+				 endpoint, cluster_id, attr_id);
+		return false;
+	}
+
+	*value = *(uint16_t *)attr->data_p;
+	return true;
+}
+
+static bool read_message_u16_attr(const esp_zb_zcl_set_attr_value_message_t *message, uint16_t *value)
+{
+	if (!value || !message->attribute.data.value || message->attribute.data.size < sizeof(uint16_t))
+	{
+		ESP_LOGW(TAG, "Invalid u16 attribute payload: attribute(0x%x), data size(%d)",
+				 message->attribute.id, message->attribute.data.size);
+		return false;
+	}
+
+	*value = *(uint16_t *)message->attribute.data.value;
+	return true;
+}
+
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
 {
 	esp_err_t ret = ESP_OK;
@@ -312,31 +339,30 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 				if (message->attribute.id == ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_X_ID &&
 					message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16)
 				{
-					light_color_x = message->attribute.data.value ? *(uint16_t *) message->attribute.data.value
-																  : light_color_x;
-					light_color_y = *(uint16_t *) esp_zb_zcl_get_attribute(message->info.dst_endpoint,
-																		   message->info.cluster,
-																		   ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-																		   ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_Y_ID)
-							->data_p;
+					if (!read_message_u16_attr(message, &light_color_x) ||
+						!read_local_u16_attr(message->info.dst_endpoint, message->info.cluster,
+											 ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_Y_ID, &light_color_y))
+					{
+						break;
+					}
 					ESP_LOGI(TAG, "Light color x changes to 0x%x", light_color_x);
+					light_driver_set_color_xy(light_color_x, light_color_y);
 				} else if (message->attribute.id == ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_Y_ID &&
 						   message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16)
 				{
-					light_color_y = message->attribute.data.value ? *(uint16_t *) message->attribute.data.value
-																  : light_color_y;
-					light_color_x = *(uint16_t *) esp_zb_zcl_get_attribute(message->info.dst_endpoint,
-																		   message->info.cluster,
-																		   ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-																		   ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_X_ID)
-							->data_p;
+					if (!read_message_u16_attr(message, &light_color_y) ||
+						!read_local_u16_attr(message->info.dst_endpoint, message->info.cluster,
+											 ESP_ZB_ZCL_ATTR_COLOR_CONTROL_CURRENT_X_ID, &light_color_x))
+					{
+						break;
+					}
 					ESP_LOGI(TAG, "Light color y changes to 0x%x", light_color_y);
+					light_driver_set_color_xy(light_color_x, light_color_y);
 				} else
 				{
 					ESP_LOGW(TAG, "Color control cluster data: attribute(0x%x), type(0x%x)", message->attribute.id,
 							 message->attribute.data.type);
 				}
-				light_driver_set_color_xy(light_color_x, light_color_y);
 				break;
 			case ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL:
 				if (message->attribute.id == ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID &&

@@ -17,9 +17,101 @@
 #include "led_strip.h"
 #include "light_driver.h"
 
+#include <math.h>
+
+typedef struct {
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+} rgb_color_t;
+
+static const char *TAG = "LIGHT_DRIVER";
 static led_strip_handle_t s_led_strip;
 static uint8_t s_red = 255, s_green = 255, s_blue = 255, s_level = 255;
 static bool s_power = false;
+
+static uint8_t clamp_unit_to_u8(float value)
+{
+    if (!isfinite(value) || value <= 0.0f) {
+        return 0;
+    }
+    if (value >= 1.0f) {
+        return UINT8_MAX;
+    }
+    return (uint8_t)(value * (float)UINT8_MAX + 0.5f);
+}
+
+static bool xy_to_rgb(uint16_t color_current_x, uint16_t color_current_y, rgb_color_t *rgb)
+{
+    if (!rgb || color_current_y == 0) {
+        return false;
+    }
+
+    const float color_x = (float)color_current_x / 65535.0f;
+    const float color_y = (float)color_current_y / 65535.0f;
+    const float color_z = 1.0f - color_x - color_y;
+
+    if (color_z < 0.0f) {
+        return false;
+    }
+
+    const float color_X = color_x / color_y;
+    const float color_Z = color_z / color_y;
+    const float red_f = 3.240479f * color_X - 1.537150f - 0.498535f * color_Z;
+    const float green_f = -0.969256f * color_X + 1.875992f + 0.041556f * color_Z;
+    const float blue_f = 0.055648f * color_X - 0.204043f + 1.057311f * color_Z;
+
+    rgb->red = clamp_unit_to_u8(red_f);
+    rgb->green = clamp_unit_to_u8(green_f);
+    rgb->blue = clamp_unit_to_u8(blue_f);
+    return true;
+}
+
+static rgb_color_t hsv_to_rgb(uint8_t hue, uint8_t sat, uint8_t value)
+{
+    const float v = (float)value / (float)UINT8_MAX;
+    const float s = (float)sat / (float)UINT8_MAX;
+
+    if (sat == 0) {
+        const uint8_t grey = clamp_unit_to_u8(v);
+        return (rgb_color_t){.red = grey, .green = grey, .blue = grey};
+    }
+
+    const float h = ((float)hue * 360.0f) / 256.0f;
+    const float c = v * s;
+    const float h_sector = h / 60.0f;
+    const float x = c * (1.0f - fabsf(fmodf(h_sector, 2.0f) - 1.0f));
+    const float m = v - c;
+    float red = 0.0f;
+    float green = 0.0f;
+    float blue = 0.0f;
+
+    if (h_sector < 1.0f) {
+        red = c;
+        green = x;
+    } else if (h_sector < 2.0f) {
+        red = x;
+        green = c;
+    } else if (h_sector < 3.0f) {
+        green = c;
+        blue = x;
+    } else if (h_sector < 4.0f) {
+        green = x;
+        blue = c;
+    } else if (h_sector < 5.0f) {
+        red = x;
+        blue = c;
+    } else {
+        red = c;
+        blue = x;
+    }
+
+    return (rgb_color_t){
+        .red = clamp_unit_to_u8(red + m),
+        .green = clamp_unit_to_u8(green + m),
+        .blue = clamp_unit_to_u8(blue + m),
+    };
+}
 
 static inline void apply_current_output(void)
 {
@@ -39,27 +131,24 @@ static inline void apply_current_output(void)
 
 void light_driver_set_color_xy(uint16_t color_current_x, uint16_t color_current_y)
 {
-    float red_f = 0, green_f = 0, blue_f = 0, color_x, color_y;
-    color_x = (float)color_current_x / 65535.0f;
-    color_y = (float)color_current_y / 65535.0f;
-    /* assume color_Y is full light level value 1  (0-1.0) */
-    float color_X = color_x / color_y;
-    float color_Z = (1.0f - color_x - color_y) / color_y;
-    /* change from xy to linear RGB NOT sRGB */
-    XYZ_to_RGB(color_X, 1.0f, color_Z, red_f, green_f, blue_f);
-    s_red = (uint8_t)(red_f * 255.0f);
-    s_green = (uint8_t)(green_f * 255.0f);
-    s_blue = (uint8_t)(blue_f * 255.0f);
+    rgb_color_t rgb;
+    if (!xy_to_rgb(color_current_x, color_current_y, &rgb)) {
+        ESP_LOGW(TAG, "Ignoring invalid XY color: x=0x%04x, y=0x%04x", color_current_x, color_current_y);
+        return;
+    }
+
+    s_red = rgb.red;
+    s_green = rgb.green;
+    s_blue = rgb.blue;
     if (s_power) apply_current_output();
 }
 
 void light_driver_set_color_hue_sat(uint8_t hue, uint8_t sat)
 {
-    float red_f, green_f, blue_f;
-    HSV_to_RGB(hue, sat, UINT8_MAX, red_f, green_f, blue_f);
-    s_red = (uint8_t)red_f;
-    s_green = (uint8_t)green_f;
-    s_blue = (uint8_t)blue_f;
+    const rgb_color_t rgb = hsv_to_rgb(hue, sat, UINT8_MAX);
+    s_red = rgb.red;
+    s_green = rgb.green;
+    s_blue = rgb.blue;
     if (s_power) apply_current_output();
 }
 

@@ -23,12 +23,18 @@
 #define SENSOR_ADC_BITWIDTH ADC_BITWIDTH_12
 #define SENSOR_ADC_APPROX_FULL_SCALE_MV 3300
 
-// Select the ADC1 channel your sensor output is wired to
-// Adjust as needed for your board's ADC-capable pinout
-// ADC1_CH6 corresponds to ADC_CHANNEL_6 in the oneshot API
-#define SENSOR_ADC_CHANNEL ADC_CHANNEL_6
-
 #define MAX_VALUES 20
+#define DEPTH_ADC_SAMPLE_COUNT 8
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+
+typedef struct {
+	const char *name;
+	uint8_t endpoint;
+	adc_channel_t adc_channel;
+	float values[MAX_VALUES];
+	int current_index;
+	int count;
+} depth_sensor_state_t;
 
 static const char *TAG = "ESP_ZB_DIST_SENSOR";
 
@@ -36,14 +42,18 @@ static const char *TAG = "ESP_ZB_DIST_SENSOR";
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 static adc_cali_handle_t s_adc_cali_handle = NULL;
 static bool s_adc_cali_enabled = false;
-static adc_channel_t s_adc_channel = SENSOR_ADC_CHANNEL;
+
+static depth_sensor_state_t s_depth_sensors[] = {
+	{.name = "tank_1", .endpoint = HA_ESP_SENSOR_ENDPOINT, .adc_channel = ADC_CHANNEL_6},
+	{.name = "tank_2", .endpoint = HA_ESP_SENSOR_ENDPOINT + 1, .adc_channel = ADC_CHANNEL_2},
+};
 
 static int16_t zb_temperature_to_s16(float temp)
 {
 	return (int16_t) (temp * 100);
 }
 
-float calculate_average(float values[], int count)
+static float calculate_average(const float values[], int count)
 {
 	float sum = 0.0;
 	for (int i = 0; i < count; i++)
@@ -53,92 +63,99 @@ float calculate_average(float values[], int count)
 	return sum / count;
 }
 
-_Noreturn void pressure_task(void *pvParameters)
+static esp_err_t read_depth_sensor_raw(const depth_sensor_state_t *sensor, int *raw)
 {
-    float values[MAX_VALUES] = {0.0f};
-    int currentIndex = 0;
-    int count = 0;
+	ESP_RETURN_ON_FALSE(sensor && raw, ESP_ERR_INVALID_ARG, TAG, "Invalid depth sensor read request");
 
-    while (true)
-    {
-        int voltage_mv = 0;
+	int raw_first = 0;
+	esp_err_t res = adc_oneshot_read(s_adc_handle, sensor->adc_channel, &raw_first);
+	if (res != ESP_OK)
+	{
+		ESP_LOGW(TAG, "%s ADC read failed: %s", sensor->name, esp_err_to_name(res));
+		return res;
+	}
 
-        // Take multiple samples and compute a trimmed mean (drop min and max) to suppress outliers
-        const int NSAMPLES = 8;
-        int raw_first = 0;
-        esp_err_t res = adc_oneshot_read(s_adc_handle, s_adc_channel, &raw_first);
-        if (res != ESP_OK)
-        {
-            ESP_LOGW(TAG, "ADC read failed: %s", esp_err_to_name(res));
-            vTaskDelay(pdMS_TO_TICKS(ESP_DIST_SENSOR_UPDATE_INTERVAL * 1000));
-            continue;
-        }
-        int sum_raw = raw_first;
-        int min_raw = raw_first;
-        int max_raw = raw_first;
-        bool all_ok = true;
-        for (int i = 1; i < NSAMPLES; ++i)
-        {
-            int r = 0;
-            res = adc_oneshot_read(s_adc_handle, s_adc_channel, &r);
-            if (res != ESP_OK)
-            {
-                ESP_LOGW(TAG, "ADC read failed (sample %d/%d): %s", i + 1, NSAMPLES, esp_err_to_name(res));
-                all_ok = false;
-                break;
-            }
-            sum_raw += r;
-            if (r < min_raw) min_raw = r;
-            if (r > max_raw) max_raw = r;
-        }
-        if (!all_ok)
-        {
-            vTaskDelay(pdMS_TO_TICKS(ESP_DIST_SENSOR_UPDATE_INTERVAL * 1000));
-            continue;
-        }
-        int raw = (sum_raw - min_raw - max_raw) / (NSAMPLES - 2);
+	int sum_raw = raw_first;
+	int min_raw = raw_first;
+	int max_raw = raw_first;
+	for (int i = 1; i < DEPTH_ADC_SAMPLE_COUNT; ++i)
+	{
+		int sample_raw = 0;
+		res = adc_oneshot_read(s_adc_handle, sensor->adc_channel, &sample_raw);
+		if (res != ESP_OK)
+		{
+			ESP_LOGW(TAG, "%s ADC read failed (sample %d/%d): %s",
+					 sensor->name, i + 1, DEPTH_ADC_SAMPLE_COUNT, esp_err_to_name(res));
+			return res;
+		}
+		sum_raw += sample_raw;
+		if (sample_raw < min_raw) min_raw = sample_raw;
+		if (sample_raw > max_raw) max_raw = sample_raw;
+	}
 
-        if (s_adc_cali_enabled)
-        {
-            if (adc_cali_raw_to_voltage(s_adc_cali_handle, raw, &voltage_mv) != ESP_OK)
-            {
-                ESP_LOGW(TAG, "ADC calibration conversion failed, using approximation");
-                voltage_mv = depth_sensor_raw_to_voltage_mv_approx(
-                    raw, SENSOR_ADC_BITWIDTH, SENSOR_ADC_APPROX_FULL_SCALE_MV);
-            }
-        }
-        else
-        {
-            // Approximate linear conversion for 12 dB attenuation near a 3.3 V full-scale input.
-            voltage_mv = depth_sensor_raw_to_voltage_mv_approx(
-                raw, SENSOR_ADC_BITWIDTH, SENSOR_ADC_APPROX_FULL_SCALE_MV);
-        }
-
-        float current_mA = depth_sensor_voltage_to_current_ma(voltage_mv);
-        float depth_mm = depth_sensor_voltage_to_depth_mm(voltage_mv);
-
-        // Keep millimeters for Zigbee reporting.
-        float depth_mm_rounded = roundf(depth_mm);
-
-        values[currentIndex] = depth_mm_rounded;
-        currentIndex = (currentIndex + 1) % MAX_VALUES;
-        if (count < MAX_VALUES) count++;
-
-        float avg_mm = roundf(calculate_average(values, count));
-
-        ESP_LOGI(TAG, "Depth: raw=%d, %d mV, %.2f mA, %.0f mm (avg %.0f mm)",
-                 raw, voltage_mv, current_mA, depth_mm_rounded, avg_mm);
-
-        esp_zb_lock_acquire(portMAX_DELAY);
-        esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
-                                     ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                     ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &avg_mm, false);
-        esp_zb_lock_release();
-
-        vTaskDelay(pdMS_TO_TICKS(ESP_DIST_SENSOR_UPDATE_INTERVAL * 1000));
-    }
+	*raw = (sum_raw - min_raw - max_raw) / (DEPTH_ADC_SAMPLE_COUNT - 2);
+	return ESP_OK;
 }
 
+static int depth_sensor_raw_to_voltage_mv(const depth_sensor_state_t *sensor, int raw)
+{
+	int voltage_mv = 0;
+	if (s_adc_cali_enabled)
+	{
+		if (adc_cali_raw_to_voltage(s_adc_cali_handle, raw, &voltage_mv) == ESP_OK)
+		{
+			return voltage_mv;
+		}
+		ESP_LOGW(TAG, "%s ADC calibration conversion failed, using approximation", sensor->name);
+	}
+
+	// Approximate linear conversion for 12 dB attenuation near a 3.3 V full-scale input.
+	return depth_sensor_raw_to_voltage_mv_approx(raw, SENSOR_ADC_BITWIDTH, SENSOR_ADC_APPROX_FULL_SCALE_MV);
+}
+
+static esp_err_t update_depth_sensor(depth_sensor_state_t *sensor)
+{
+	int raw = 0;
+	ESP_RETURN_ON_ERROR(read_depth_sensor_raw(sensor, &raw), TAG, "Failed to read depth sensor %s", sensor->name);
+
+	int voltage_mv = depth_sensor_raw_to_voltage_mv(sensor, raw);
+	float current_mA = depth_sensor_voltage_to_current_ma(voltage_mv);
+	float depth_mm = depth_sensor_voltage_to_depth_mm(voltage_mv);
+	float depth_mm_rounded = roundf(depth_mm);
+
+	sensor->values[sensor->current_index] = depth_mm_rounded;
+	sensor->current_index = (sensor->current_index + 1) % MAX_VALUES;
+	if (sensor->count < MAX_VALUES) sensor->count++;
+
+	float avg_mm = roundf(calculate_average(sensor->values, sensor->count));
+
+	ESP_LOGI(TAG, "%s depth: raw=%d, %d mV, %.2f mA, %.0f mm (avg %.0f mm)",
+			 sensor->name, raw, voltage_mv, current_mA, depth_mm_rounded, avg_mm);
+
+	esp_zb_lock_acquire(portMAX_DELAY);
+	esp_zb_zcl_set_attribute_val(sensor->endpoint,
+								 ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+								 ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &avg_mm, false);
+	esp_zb_lock_release();
+	return ESP_OK;
+}
+
+_Noreturn void pressure_task(void *pvParameters)
+{
+	while (true)
+	{
+		for (size_t i = 0; i < ARRAY_SIZE(s_depth_sensors); ++i)
+		{
+			esp_err_t res = update_depth_sensor(&s_depth_sensors[i]);
+			if (res != ESP_OK)
+			{
+				ESP_LOGW(TAG, "Skipping %s update: %s", s_depth_sensors[i].name, esp_err_to_name(res));
+			}
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(ESP_DIST_SENSOR_UPDATE_INTERVAL * 1000));
+	}
+}
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
@@ -177,9 +194,59 @@ static esp_err_t create_app_task(TaskFunction_t task_function, const char *task_
 	return ESP_OK;
 }
 
+static esp_err_t validate_depth_sensor_config(void)
+{
+	ESP_RETURN_ON_FALSE(ARRAY_SIZE(s_depth_sensors) > 0, ESP_ERR_INVALID_STATE, TAG,
+						"At least one depth sensor must be configured");
+
+	for (size_t i = 0; i < ARRAY_SIZE(s_depth_sensors); ++i)
+	{
+		ESP_RETURN_ON_FALSE(s_depth_sensors[i].name, ESP_ERR_INVALID_ARG, TAG,
+							"Depth sensor %u is missing a name", (unsigned) i);
+		ESP_RETURN_ON_FALSE(s_depth_sensors[i].endpoint > 0, ESP_ERR_INVALID_ARG, TAG,
+							"Depth sensor %s has invalid endpoint 0", s_depth_sensors[i].name);
+
+		for (size_t j = i + 1; j < ARRAY_SIZE(s_depth_sensors); ++j)
+		{
+			ESP_RETURN_ON_FALSE(s_depth_sensors[i].endpoint != s_depth_sensors[j].endpoint,
+								ESP_ERR_INVALID_ARG, TAG,
+								"Depth sensors %s and %s share endpoint %u",
+								s_depth_sensors[i].name, s_depth_sensors[j].name,
+								s_depth_sensors[i].endpoint);
+			ESP_RETURN_ON_FALSE(s_depth_sensors[i].adc_channel != s_depth_sensors[j].adc_channel,
+								ESP_ERR_INVALID_ARG, TAG,
+								"Depth sensors %s and %s share ADC channel %d",
+								s_depth_sensors[i].name, s_depth_sensors[j].name,
+								s_depth_sensors[i].adc_channel);
+		}
+	}
+
+	return ESP_OK;
+}
+
+static esp_err_t configure_depth_sensor_adc_channels(void)
+{
+	adc_oneshot_chan_cfg_t chan_cfg = {
+			.bitwidth = SENSOR_ADC_BITWIDTH,
+			.atten = SENSOR_ADC_ATTEN,
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(s_depth_sensors); ++i)
+	{
+		ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc_handle, s_depth_sensors[i].adc_channel, &chan_cfg),
+							TAG, "Failed to configure ADC channel %d for %s",
+							s_depth_sensors[i].adc_channel, s_depth_sensors[i].name);
+		ESP_LOGI(TAG, "Configured %s on endpoint %u using ADC channel %d",
+				 s_depth_sensors[i].name, s_depth_sensors[i].endpoint, s_depth_sensors[i].adc_channel);
+	}
+
+	return ESP_OK;
+}
+
 static esp_err_t deferred_driver_init(void)
 {
 	light_driver_init(LIGHT_DEFAULT_OFF);
+	ESP_RETURN_ON_ERROR(validate_depth_sensor_config(), TAG, "Invalid depth sensor configuration");
 
 	// Initialize ADC Oneshot driver (Unit 1)
 	adc_oneshot_unit_init_cfg_t init_config = {
@@ -189,14 +256,7 @@ static esp_err_t deferred_driver_init(void)
 	ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&init_config, &s_adc_handle),
 						TAG, "Failed to initialize ADC oneshot unit");
 
-	// Configure selected channel with 12 dB attenuation (approx. up to ~3.3V)
-	adc_oneshot_chan_cfg_t chan_cfg = {
-			.bitwidth = SENSOR_ADC_BITWIDTH,
-			.atten = SENSOR_ADC_ATTEN,
-	};
-	s_adc_channel = SENSOR_ADC_CHANNEL;
-	ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc_handle, s_adc_channel, &chan_cfg),
-						TAG, "Failed to configure ADC channel");
+	ESP_RETURN_ON_ERROR(configure_depth_sensor_adc_channels(), TAG, "Failed to configure depth sensor ADC channels");
 
 	// Try to enable calibration (curve fitting scheme)
 	adc_cali_curve_fitting_config_t cali_config = {
@@ -455,9 +515,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 }
 
 static esp_zb_cluster_list_t *
-custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor,
-									   esp_zb_temperature_meas_cluster_cfg_t *temperature_sensor,
-									   esp_zb_color_dimmable_light_cfg_t *light)
+custom_primary_endpoint_clusters_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor,
+										esp_zb_temperature_meas_cluster_cfg_t *temperature_sensor,
+										esp_zb_color_dimmable_light_cfg_t *light)
 {
 	esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
 
@@ -505,20 +565,45 @@ custom_distance_sensor_clusters_create(esp_zb_analog_output_cluster_cfg_t *dista
 	return cluster_list;
 }
 
+static esp_zb_cluster_list_t *
+custom_depth_endpoint_clusters_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor)
+{
+	esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+	ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_output_cluster(cluster_list,
+																  esp_zb_analog_output_cluster_create(
+																		  distance_sensor),
+																  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+	return cluster_list;
+}
+
 static esp_zb_ep_list_t *
-custom_distance_sensor_ep_create(esp_zb_analog_output_cluster_cfg_t *distance_sensor,
+custom_distance_sensor_ep_create(esp_zb_analog_output_cluster_cfg_t *distance_sensors,
 								 esp_zb_temperature_meas_cluster_cfg_t *temperature_sensor,
 								 esp_zb_color_dimmable_light_cfg_t *light)
 {
 	esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
 	esp_zb_endpoint_config_t endpoint_config = {
-			.endpoint = HA_ESP_SENSOR_ENDPOINT,
+			.endpoint = s_depth_sensors[0].endpoint,
 			.app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
 			.app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
 			.app_device_version = 0
 	};
-	esp_zb_ep_list_add_ep(ep_list, custom_distance_sensor_clusters_create(distance_sensor, temperature_sensor, light),
+	esp_zb_ep_list_add_ep(ep_list,
+						  custom_primary_endpoint_clusters_create(&distance_sensors[0], temperature_sensor, light),
 						  endpoint_config);
+
+	for (size_t i = 1; i < ARRAY_SIZE(s_depth_sensors); ++i)
+	{
+		esp_zb_endpoint_config_t depth_endpoint_config = {
+				.endpoint = s_depth_sensors[i].endpoint,
+				.app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+				.app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
+				.app_device_version = 0
+		};
+		esp_zb_ep_list_add_ep(ep_list,
+							  custom_depth_endpoint_clusters_create(&distance_sensors[i]),
+							  depth_endpoint_config);
+	}
 	return ep_list;
 }
 
@@ -529,7 +614,15 @@ static void esp_zb_task(void *pvParameters)
 
 	esp_zb_init(&zb_nwk_cfg);
 
-	esp_zb_analog_output_cluster_cfg_t analog_cfg = {.out_of_service = false, .present_value = 0, .status_flags = 0};
+	esp_zb_analog_output_cluster_cfg_t analog_cfg[ARRAY_SIZE(s_depth_sensors)];
+	for (size_t i = 0; i < ARRAY_SIZE(s_depth_sensors); ++i)
+	{
+		analog_cfg[i] = (esp_zb_analog_output_cluster_cfg_t) {
+				.out_of_service = false,
+				.present_value = 0,
+				.status_flags = 0
+		};
+	}
 	esp_zb_temperature_meas_cluster_cfg_t temp_cfg = {.measured_value = ESP_ZB_ZCL_TEMP_MEASUREMENT_MEASURED_VALUE_DEFAULT, .min_value = zb_temperature_to_s16(
 			ESP_TEMP_SENSOR_MIN_VALUE), .max_value = zb_temperature_to_s16(ESP_TEMP_SENSOR_MAX_VALUE)};
 	esp_zb_color_dimmable_light_cfg_t light_cfg = {
@@ -570,30 +663,32 @@ static void esp_zb_task(void *pvParameters)
 					},
 
 	};
-	esp_zb_ep_list_t *esp_zb_sensor_ep = custom_distance_sensor_ep_create(&analog_cfg, &temp_cfg, &light_cfg);
+	esp_zb_ep_list_t *esp_zb_sensor_ep = custom_distance_sensor_ep_create(analog_cfg, &temp_cfg, &light_cfg);
 
 	/* Register the device */
 	esp_zb_device_register(esp_zb_sensor_ep);
 
-	/* Config the reporting info  */
-	esp_zb_zcl_reporting_info_t reporting_info = {
-			.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
-			.ep = HA_ESP_SENSOR_ENDPOINT,
-			.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT,
-			.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-			.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-			/* Periodic reporting: every 1..10 seconds */
-			.u.send_info.min_interval = 1,
-			.u.send_info.max_interval = 10,
-			.u.send_info.def_min_interval = 1,
-			.u.send_info.def_max_interval = 10,
-			/* Neutralize delta to avoid type mismatch on float attribute; rely on periodic updates */
-			.u.send_info.delta.u16 = 0,
-			.attr_id = ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID,
-			.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
-	};
+	for (size_t i = 0; i < ARRAY_SIZE(s_depth_sensors); ++i)
+	{
+		esp_zb_zcl_reporting_info_t reporting_info = {
+				.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+				.ep = s_depth_sensors[i].endpoint,
+				.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT,
+				.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+				.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+				/* Periodic reporting: every 1..10 seconds */
+				.u.send_info.min_interval = 1,
+				.u.send_info.max_interval = 10,
+				.u.send_info.def_min_interval = 1,
+				.u.send_info.def_max_interval = 10,
+				/* Neutralize delta to avoid type mismatch on float attribute; rely on periodic updates */
+				.u.send_info.delta.u16 = 0,
+				.attr_id = ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID,
+				.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
+		};
 
-	esp_zb_zcl_update_reporting_info(&reporting_info);
+		esp_zb_zcl_update_reporting_info(&reporting_info);
+	}
 
 	/* Also configure periodic reporting for Temperature Measurement (s16: value = degC * 100) */
 	esp_zb_zcl_reporting_info_t temp_reporting_info = {

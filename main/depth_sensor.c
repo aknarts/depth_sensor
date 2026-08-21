@@ -42,6 +42,9 @@ static const char *TAG = "ESP_ZB_DIST_SENSOR";
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 static adc_cali_handle_t s_adc_cali_handle = NULL;
 static bool s_adc_cali_enabled = false;
+static TaskHandle_t s_identify_task_handle = NULL;
+static uint16_t s_identify_time = 0;
+static portMUX_TYPE s_identify_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static depth_sensor_state_t s_depth_sensors[] = {
 	{.name = "tank_1", .endpoint = HA_ESP_SENSOR_ENDPOINT, .adc_channel = ADC_CHANNEL_6},
@@ -236,8 +239,18 @@ static esp_err_t configure_depth_sensor_adc_channels(void)
 		ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc_handle, s_depth_sensors[i].adc_channel, &chan_cfg),
 							TAG, "Failed to configure ADC channel %d for %s",
 							s_depth_sensors[i].adc_channel, s_depth_sensors[i].name);
-		ESP_LOGI(TAG, "Configured %s on endpoint %u using ADC channel %d",
-				 s_depth_sensors[i].name, s_depth_sensors[i].endpoint, s_depth_sensors[i].adc_channel);
+
+		int gpio_num;
+		ESP_RETURN_ON_ERROR(adc_oneshot_channel_to_io(ADC_UNIT_1, s_depth_sensors[i].adc_channel, &gpio_num),
+							TAG, "Failed to resolve GPIO for ADC channel %d",
+							s_depth_sensors[i].adc_channel);
+		ESP_RETURN_ON_ERROR(gpio_pullup_dis((gpio_num_t) gpio_num), TAG,
+							"Failed to disable pull-up on GPIO%d", gpio_num);
+		ESP_RETURN_ON_ERROR(gpio_pulldown_en((gpio_num_t) gpio_num), TAG,
+							"Failed to enable pull-down on GPIO%d", gpio_num);
+		ESP_LOGI(TAG, "Configured %s on endpoint %u using ADC channel %d (GPIO%d, pull-down enabled)",
+				 s_depth_sensors[i].name, s_depth_sensors[i].endpoint,
+				 s_depth_sensors[i].adc_channel, gpio_num);
 	}
 
 	return ESP_OK;
@@ -355,15 +368,25 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 static void esp_zb_identify(void *pvParameters)
 {
 	bool light_state = false;
-	for (int i = 0; i < 50; ++i)
+	while (true)
 	{
+		taskENTER_CRITICAL(&s_identify_lock);
+		uint16_t identify_time = s_identify_time;
+		if (identify_time == 0)
+		{
+			s_identify_task_handle = NULL;
+		}
+		taskEXIT_CRITICAL(&s_identify_lock);
+		if (identify_time == 0)
+		{
+			break;
+		}
+
 		light_state = !light_state;
 		light_driver_set_power(light_state);
-
 		vTaskDelay(pdMS_TO_TICKS(1000));
-	};
+	}
 	light_driver_set_power(false);
-	vTaskDelay(pdMS_TO_TICKS(1000));
 	vTaskDelete(NULL);
 }
 
@@ -401,6 +424,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 	uint8_t light_level = 0;
 	uint16_t light_color_x = 0;
 	uint16_t light_color_y = 0;
+	uint16_t identify_time = 0;
 	ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message");
 	ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG,
 						"Received message: error status(%d)",
@@ -469,7 +493,20 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 				}
 				break;
 			case ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY:
-				ret = create_app_task(esp_zb_identify, "Identify", 4096, NULL, 5, NULL);
+				if (message->attribute.id == ESP_ZB_ZCL_ATTR_IDENTIFY_IDENTIFY_TIME_ID &&
+					message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16 &&
+					read_message_u16_attr(message, &identify_time))
+				{
+					taskENTER_CRITICAL(&s_identify_lock);
+					s_identify_time = identify_time;
+					bool start_identify_task = s_identify_time > 0 && s_identify_task_handle == NULL;
+					taskEXIT_CRITICAL(&s_identify_lock);
+					if (start_identify_task)
+					{
+						ret = create_app_task(esp_zb_identify, "Identify", 4096, NULL, 5,
+										  &s_identify_task_handle);
+					}
+				}
 				break;
 			default:
 				ESP_LOGI(TAG, "Message data: cluster(0x%x), attribute(0x%x)  ", message->info.cluster,

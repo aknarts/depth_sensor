@@ -14,6 +14,8 @@
 
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "led_strip.h"
 #include "light_driver.h"
 
@@ -27,6 +29,7 @@ typedef struct {
 
 static const char *TAG = "LIGHT_DRIVER";
 static led_strip_handle_t s_led_strip;
+static SemaphoreHandle_t s_led_lock;
 static uint8_t s_red = 255, s_green = 255, s_blue = 255, s_level = 255;
 static bool s_power = false;
 
@@ -113,20 +116,29 @@ static rgb_color_t hsv_to_rgb(uint8_t hue, uint8_t sat, uint8_t value)
     };
 }
 
-static inline void apply_current_output(void)
+static void apply_current_output_locked(void)
 {
     if (!s_led_strip) return;
+    esp_err_t err;
     if (s_power) {
         float ratio = (float)s_level / 255;
-        ESP_ERROR_CHECK(led_strip_set_pixel(s_led_strip, 0,
-                                            (uint8_t)((float)s_red * ratio),
-                                            (uint8_t)((float)s_green * ratio),
-                                            (uint8_t)((float)s_blue * ratio)));
+        err = led_strip_set_pixel(s_led_strip, 0,
+                                  (uint8_t)((float)s_red * ratio),
+                                  (uint8_t)((float)s_green * ratio),
+                                  (uint8_t)((float)s_blue * ratio));
     } else {
         // Fully off when power is false
-        ESP_ERROR_CHECK(led_strip_set_pixel(s_led_strip, 0, 0, 0, 0));
+        err = led_strip_set_pixel(s_led_strip, 0, 0, 0, 0);
     }
-    ESP_ERROR_CHECK(led_strip_refresh(s_led_strip));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set LED pixel: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = led_strip_refresh(s_led_strip);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to refresh LED strip: %s", esp_err_to_name(err));
+    }
 }
 
 void light_driver_set_color_xy(uint16_t color_current_x, uint16_t color_current_y)
@@ -137,43 +149,56 @@ void light_driver_set_color_xy(uint16_t color_current_x, uint16_t color_current_
         return;
     }
 
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_red = rgb.red;
     s_green = rgb.green;
     s_blue = rgb.blue;
-    if (s_power) apply_current_output();
+    if (s_power) apply_current_output_locked();
+    xSemaphoreGive(s_led_lock);
 }
 
 void light_driver_set_color_hue_sat(uint8_t hue, uint8_t sat)
 {
     const rgb_color_t rgb = hsv_to_rgb(hue, sat, UINT8_MAX);
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_red = rgb.red;
     s_green = rgb.green;
     s_blue = rgb.blue;
-    if (s_power) apply_current_output();
+    if (s_power) apply_current_output_locked();
+    xSemaphoreGive(s_led_lock);
 }
 
 void light_driver_set_color_RGB(uint8_t red, uint8_t green, uint8_t blue)
 {
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_red = red;
     s_green = green;
     s_blue = blue;
-    if (s_power) apply_current_output();
+    if (s_power) apply_current_output_locked();
+    xSemaphoreGive(s_led_lock);
 }
 
 void light_driver_set_power(bool power)
 {
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_power = power;
-    apply_current_output();
+    apply_current_output_locked();
+    xSemaphoreGive(s_led_lock);
 }
 
 void light_driver_set_level(uint8_t level)
 {
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_level = level;
-    if (s_power) apply_current_output();
+    if (s_power) apply_current_output_locked();
+    xSemaphoreGive(s_led_lock);
 }
 
 void light_driver_init(bool power)
 {
+    s_led_lock = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_led_lock ? ESP_OK : ESP_ERR_NO_MEM);
+
     led_strip_config_t led_strip_conf = {
         .max_leds = CONFIG_EXAMPLE_STRIP_LED_NUMBER,
         .strip_gpio_num = CONFIG_EXAMPLE_STRIP_LED_GPIO,
@@ -186,5 +211,5 @@ void light_driver_init(bool power)
     // Start from a known state
     s_red = 255; s_green = 255; s_blue = 255; s_level = 255;
     s_power = power;
-    apply_current_output();
+    apply_current_output_locked();
 }

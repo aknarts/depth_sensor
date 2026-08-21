@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 #include "led_strip.h"
 #include "light_driver.h"
 
@@ -30,8 +31,13 @@ typedef struct {
 static const char *TAG = "LIGHT_DRIVER";
 static led_strip_handle_t s_led_strip;
 static SemaphoreHandle_t s_led_lock;
+static TimerHandle_t s_apply_timer;
 static uint8_t s_red = 255, s_green = 255, s_blue = 255, s_level = 255;
 static bool s_power = false;
+static bool s_identify_active = false;
+static bool s_identify_power = false;
+
+#define LIGHT_APPLY_DEBOUNCE_MS 150
 
 static uint8_t clamp_unit_to_u8(float value)
 {
@@ -119,8 +125,9 @@ static rgb_color_t hsv_to_rgb(uint8_t hue, uint8_t sat, uint8_t value)
 static void apply_current_output_locked(void)
 {
     if (!s_led_strip) return;
+    const bool output_power = s_identify_active ? s_identify_power : s_power;
     esp_err_t err;
-    if (s_power) {
+    if (output_power) {
         float ratio = (float)s_level / 255;
         err = led_strip_set_pixel(s_led_strip, 0,
                                   (uint8_t)((float)s_red * ratio),
@@ -141,6 +148,21 @@ static void apply_current_output_locked(void)
     }
 }
 
+static void apply_output_timer_cb(TimerHandle_t timer)
+{
+    (void) timer;
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
+    apply_current_output_locked();
+    xSemaphoreGive(s_led_lock);
+}
+
+static void schedule_current_output_locked(void)
+{
+    if (xTimerReset(s_apply_timer, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to schedule LED output update");
+    }
+}
+
 void light_driver_set_color_xy(uint16_t color_current_x, uint16_t color_current_y)
 {
     rgb_color_t rgb;
@@ -153,7 +175,7 @@ void light_driver_set_color_xy(uint16_t color_current_x, uint16_t color_current_
     s_red = rgb.red;
     s_green = rgb.green;
     s_blue = rgb.blue;
-    if (s_power) apply_current_output_locked();
+    schedule_current_output_locked();
     xSemaphoreGive(s_led_lock);
 }
 
@@ -164,7 +186,7 @@ void light_driver_set_color_hue_sat(uint8_t hue, uint8_t sat)
     s_red = rgb.red;
     s_green = rgb.green;
     s_blue = rgb.blue;
-    if (s_power) apply_current_output_locked();
+    schedule_current_output_locked();
     xSemaphoreGive(s_led_lock);
 }
 
@@ -174,7 +196,7 @@ void light_driver_set_color_RGB(uint8_t red, uint8_t green, uint8_t blue)
     s_red = red;
     s_green = green;
     s_blue = blue;
-    if (s_power) apply_current_output_locked();
+    schedule_current_output_locked();
     xSemaphoreGive(s_led_lock);
 }
 
@@ -182,6 +204,15 @@ void light_driver_set_power(bool power)
 {
     xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_power = power;
+    schedule_current_output_locked();
+    xSemaphoreGive(s_led_lock);
+}
+
+void light_driver_set_identify(bool active, bool power)
+{
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
+    s_identify_active = active;
+    s_identify_power = power;
     apply_current_output_locked();
     xSemaphoreGive(s_led_lock);
 }
@@ -190,7 +221,7 @@ void light_driver_set_level(uint8_t level)
 {
     xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_level = level;
-    if (s_power) apply_current_output_locked();
+    schedule_current_output_locked();
     xSemaphoreGive(s_led_lock);
 }
 
@@ -198,6 +229,9 @@ void light_driver_init(bool power)
 {
     s_led_lock = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(s_led_lock ? ESP_OK : ESP_ERR_NO_MEM);
+    s_apply_timer = xTimerCreate("light_apply", pdMS_TO_TICKS(LIGHT_APPLY_DEBOUNCE_MS),
+                                 pdFALSE, NULL, apply_output_timer_cb);
+    ESP_ERROR_CHECK(s_apply_timer ? ESP_OK : ESP_ERR_NO_MEM);
 
     led_strip_config_t led_strip_conf = {
         .max_leds = CONFIG_EXAMPLE_STRIP_LED_NUMBER,
@@ -211,5 +245,7 @@ void light_driver_init(bool power)
     // Start from a known state
     s_red = 255; s_green = 255; s_blue = 255; s_level = 255;
     s_power = power;
+    s_identify_active = false;
+    s_identify_power = false;
     apply_current_output_locked();
 }

@@ -38,6 +38,15 @@ extern "C" {
 void light_driver_set_power(bool power);
 
 /**
+* @brief Temporarily override light power for Zigbee Identify without changing
+*        the requested light state.
+*
+* @param active enable or disable the Identify override
+* @param power  output power while the Identify override is active
+*/
+void light_driver_set_identify(bool active, bool power);
+
+/**
 * @brief color light driver init, be invoked where you want to use color light
 *
 * @param power power on/off

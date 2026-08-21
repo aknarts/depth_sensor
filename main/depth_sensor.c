@@ -383,10 +383,10 @@ static void esp_zb_identify(void *pvParameters)
 		}
 
 		light_state = !light_state;
-		light_driver_set_power(light_state);
+		light_driver_set_identify(true, light_state);
 		vTaskDelay(pdMS_TO_TICKS(1000));
 	}
-	light_driver_set_power(false);
+	light_driver_set_identify(false, false);
 	vTaskDelete(NULL);
 }
 
